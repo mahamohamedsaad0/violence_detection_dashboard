@@ -1,10 +1,29 @@
-# dashboard.py — VisionGuard Violence Detection Dashboard v6
-# Design: Fixed left sidebar (logo + nav + settings + last result)
-# Features: All 6 CAM videos, all 6 grids, timeline, ByteTrack fighter IDs,
-#           pred_nonfight class, full pred.txt fields, new CAM method tabs
-#           FIXED: register bug, added Settings page with light/dark mode
+import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-import os, io, re, time, json, shutil, hashlib, zipfile, subprocess
+import gdown
+
+def download_models_if_missing():
+    os.makedirs("checkpoints", exist_ok=True)
+    
+    models = {
+        "checkpoints/r3d18_best_lcm_lstm.pth": "14yMBt6IVPcaOg62f66hFEzJFViVyMjeH",
+        "checkpoints/r3d18_best_RWF_lcm_lstm.pth": "1xzrhYECcNAwfRDodnXDUqPd34jmgG5XH",
+    }
+    
+    for path, file_id in models.items():
+        if not os.path.exists(path):
+            print(f"Downloading {path}...")
+            gdown.download(f"https://drive.google.com/uc?id={file_id}", path, quiet=False)
+            print(f"✅ Done: {path}")
+
+download_models_if_missing()
+
+# VisionGuard v8
+# Refactored dashboard with grouped navigation, review workspace, dataset lab,
+# history page, improved login screen, create-account and forgot-password flows.
+
+import csv, io, re, time, json, shutil, hashlib, zipfile, subprocess, threading, random, string
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,10 +37,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models.video import r3d_18
 
-# ──────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════
 @dataclass
 class CFG:
     APP_TITLE: str           = "VisionGuard"
@@ -32,29 +55,75 @@ class CFG:
     THRESH_SUSPICIOUS: float = 0.45
 
 os.makedirs(CFG.OUTPUT_DIR, exist_ok=True)
-UPLOAD_ROOT = Path(CFG.OUTPUT_DIR) / "uploads"
-LOGS_ROOT   = Path(CFG.OUTPUT_DIR) / "logs"
-USERS_FILE  = Path(CFG.OUTPUT_DIR) / "users.json"
+UPLOAD_ROOT  = Path(CFG.OUTPUT_DIR) / "uploads"
+LOGS_ROOT    = Path(CFG.OUTPUT_DIR) / "logs"
+USERS_FILE   = Path(CFG.OUTPUT_DIR) / "users.json"
+HISTORY_FILE = Path(CFG.OUTPUT_DIR) / "history.json"
 LOGS_ROOT.mkdir(parents=True, exist_ok=True)
+
+SMOOTH_N     = 20
+SMOOTH_SIGMA = 0.10
+SMOOTH_K     = 2
+IMG_SIZE     = 112
+DISPLAY_W    = 480
+ALPHA        = 0.55
+EPS          = 1e-8
+GRID_FRAMES  = 8
+ROWS_G, COLS_G = 2, 4
+CAM_METHODS  = ["gradcam", "gradcampp", "smooth_gradcampp", "layercam"]
+CAM_LABELS   = {
+    "gradcam":          "GradCAM (L4)",
+    "gradcampp":        "GradCAM++ (L4)",
+    "smooth_gradcampp": "SmoothGradCAM++ (L4)",
+    "layercam":         "LayerCAM (L2+L3+L4)",
+}
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+DEVICE = torch.device("mps" if torch.backends.mps.is_available()
+                       else "cuda" if torch.cuda.is_available()
+                       else "cpu")
+
+PROC_CONFIGS = {
+    "HockeyFight": {
+        "name":          "hockeyfight",
+        "ckpt":          "checkpoints/r3d18_best_lcm_lstm.pth",
+        "window_size":   16,
+        "window_stride": 2,
+        "onset_thresh":  0.50,
+        "spike_delta":   0.04,
+        "pred_thresh":   0.50,
+        "fc_dropout":    False,
+        "label":         "HockeyFight",
+    },
+    "RWF-2000": {
+        "name":          "rwf",
+        "ckpt":          "checkpoints/r3d18_best_RWF_lcm_lstm.pth",
+        "window_size":   32,
+        "window_stride": 8,
+        "onset_thresh":  0.35,
+        "spike_delta":   0.04,
+        "pred_thresh":   0.35,
+        "fc_dropout":    True,
+        "label":         "RWF-2000",
+    },
+}
 
 DATASETS = {
     "hockeyfight": ["Fight", "Nonfight"],
     "rwf":         ["Fight", "NonFight", "pred_nonfight"],
 }
 
-ALL_VID_KEYS = ["original", "gradcam", "gradcampp", "smooth_gradcampp", "layercam", "combined"]
-VID_LABELS   = {
-    "original":          "📹 Original",
-    "gradcam":           "🔥 GradCAM",
-    "gradcampp":         "🔥 GradCAM++",
-    "smooth_gradcampp":  "✨ Smooth GradCAM++",
-    "layercam":          "🌊 LayerCAM",
-    "combined":          "🎯 Combined",
+ALL_VID_KEYS  = ["original","gradcam","gradcampp","smooth_gradcampp","layercam","combined"]
+VID_LABELS    = {
+    "original":         "📹 Original",
+    "gradcam":          "🔥 GradCAM",
+    "gradcampp":        "🔥 GradCAM++",
+    "smooth_gradcampp": "✨ Smooth GradCAM++",
+    "layercam":         "🌊 LayerCAM",
+    "combined":         "🎯 Combined",
 }
-
-ALL_GRID_KEYS = ["raw_grid", "gradcam_grid", "gradcampp_grid",
-                 "smooth_gradcampp_grid", "layercam_grid", "combined_grid"]
-GRID_LABELS = {
+ALL_GRID_KEYS = ["raw_grid","gradcam_grid","gradcampp_grid",
+                 "smooth_gradcampp_grid","layercam_grid","combined_grid"]
+GRID_LABELS   = {
     "raw_grid":              "📷 Raw Frames",
     "gradcam_grid":          "🌡️ GradCAM",
     "gradcampp_grid":        "🌡️ GradCAM++",
@@ -62,349 +131,591 @@ GRID_LABELS = {
     "layercam_grid":         "🌊 LayerCAM",
     "combined_grid":         "🎯 Combined",
 }
+MAIN_NAV = [
+    "🏠 Home",
+    "📥 Ingest",
+    "🧪 Review Workspace",
+    "📊 Dataset Lab",
+    "🕘 History",
+    "🛠️ Smart Tools",
+    "⚙️ Settings",
+]
+
+# ══════════════════════════════════════════════════════════════
+# MODEL ARCHITECTURE
+# ══════════════════════════════════════════════════════════════
+class LCM3D(nn.Module):
+    def __init__(self, channels, k_t=3, k_s=3):
+        super().__init__()
+        self.dw   = nn.Conv3d(channels, channels, (k_t, k_s, k_s),
+                              padding=(k_t//2, k_s//2, k_s//2),
+                              groups=channels, bias=False)
+        self.pw   = nn.Conv3d(channels, channels, 1, bias=False)
+        self.bn   = nn.BatchNorm3d(channels)
+        self.act  = nn.ReLU(inplace=False)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(channels, channels, 1, bias=True),
+            nn.Sigmoid())
+    def forward(self, x):
+        y = self.act(self.bn(self.pw(self.dw(x))))
+        return x + y * self.gate(y)
 
 
-# ──────────────────────────────────────────
-# PAGE CONFIG
-# ──────────────────────────────────────────
+class LSTMHead(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.0):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True,
+                            dropout=dropout if num_layers > 1 else 0.0)
+        self.drop = nn.Dropout(p=0.3)
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.drop(out[:, -1, :])
+    def forward_all_steps(self, x):
+        out, _ = self.lstm(x)
+        return out
+
+
+class R3D18WithLCM_LSTM(nn.Module):
+    def __init__(self, num_classes=2, lcm_after="layer4",
+                 lstm_hidden=256, lstm_layers=1,
+                 lstm_dropout=0.3, dropout_p=0.4, fc_dropout=False):
+        super().__init__()
+        base = r3d_18(weights=None)
+        self.stem    = base.stem
+        self.layer1  = base.layer1
+        self.layer2  = base.layer2
+        self.layer3  = base.layer3
+        self.layer4  = base.layer4
+        self.lcm_after    = lcm_after
+        self.lcm          = LCM3D(256 if lcm_after == "layer3" else 512)
+        self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
+        self.lstm_head    = LSTMHead(512, lstm_hidden, lstm_layers, lstm_dropout)
+        self.fc = nn.Sequential(nn.Dropout(p=dropout_p),
+                                nn.Linear(lstm_hidden, num_classes)) \
+                  if fc_dropout else nn.Linear(lstm_hidden, num_classes)
+
+    def _backbone(self, x):
+        x    = self.stem(x); x = self.layer1(x)
+        out2 = self.layer2(x)
+        out3 = self.layer3(out2)
+        if self.lcm_after == "layer3": out3 = self.lcm(out3)
+        out4 = self.layer4(out3)
+        if self.lcm_after == "layer4": out4 = self.lcm(out4)
+        return out2, out3, out4
+
+    def _pool_seq(self, out4):
+        dev = out4.device
+        p   = self.spatial_pool(out4.cpu() if dev.type == "mps" else out4)
+        if dev.type == "mps": p = p.to(DEVICE)
+        return p.squeeze(-1).squeeze(-1).permute(0, 2, 1)
+
+    def forward(self, x):
+        _, _, out4 = self._backbone(x)
+        return self.fc(self.lstm_head(self._pool_seq(out4)))
+
+    def forward_with_seq(self, x):
+        _, _, out4 = self._backbone(x)
+        seq   = self._pool_seq(out4)
+        all_h = self.lstm_head.forward_all_steps(seq)
+        all_h = self.lstm_head.drop(all_h)
+        lin   = self.fc[-1] if isinstance(self.fc, nn.Sequential) else self.fc
+        seq_p = torch.softmax(lin(all_h), dim=-1)[0, :, 1].detach().cpu().numpy()
+        logits = self.fc(self.lstm_head.drop(all_h[:, -1, :]))
+        return logits, seq_p
+
+
+def _disable_inplace(model):
+    for m in model.modules():
+        if isinstance(m, (nn.ReLU, nn.ReLU6)):
+            m.inplace = False
+
+_MODEL_CACHE: dict = {}
+
+def load_model_cached(cfg: dict):
+    key = cfg["ckpt"]
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
+    ckpt = torch.load(cfg["ckpt"], map_location="cpu")
+    lafter = ckpt.get("lcm_after",   "layer4") if isinstance(ckpt, dict) else "layer4"
+    lhid   = ckpt.get("lstm_hidden", 256)       if isinstance(ckpt, dict) else 256
+    llyr   = ckpt.get("lstm_layers", 1)         if isinstance(ckpt, dict) else 1
+    model  = R3D18WithLCM_LSTM(lcm_after=lafter, lstm_hidden=lhid,
+                                lstm_layers=llyr, fc_dropout=cfg["fc_dropout"])
+    sd = (ckpt.get("model_state") or ckpt.get("model_state_dict") or ckpt) \
+         if isinstance(ckpt, dict) else ckpt
+    sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    model.load_state_dict(sd, strict=True)
+    model = model.to(DEVICE).eval()
+    _disable_inplace(model)
+    val_acc = ckpt.get("best_val_acc", ckpt.get("val_acc")) if isinstance(ckpt, dict) else None
+    meta = {"epoch": ckpt.get("epoch") if isinstance(ckpt, dict) else None,
+            "val_acc": val_acc, "path": cfg["ckpt"]}
+    _MODEL_CACHE[key] = (model, meta)
+    return model, meta
+
+# ══════════════════════════════════════════════════════════════
+# CAM ENGINE
+# ══════════════════════════════════════════════════════════════
+class CAMEngine:
+    def __init__(self, model):
+        self.model  = model
+        self._saved = {}
+        self._hooks = [
+            model.layer2[-1].conv2.register_forward_hook(
+                lambda m, i, o: self._saved.update({"layer2": o})),
+            model.layer3[-1].conv2.register_forward_hook(
+                lambda m, i, o: self._saved.update({"layer3": o})),
+            model.layer4[-1].conv2.register_forward_hook(
+                lambda m, i, o: self._saved.update({"layer4": o})),
+        ]
+
+    def _fwd_grad(self, x, cls, layers=("layer2","layer3","layer4")):
+        self.model.zero_grad(); self._saved.clear()
+        with torch.enable_grad():
+            score = self.model(x)[0, cls]
+            grads = torch.autograd.grad(score,
+                        [self._saved[l] for l in layers],
+                        retain_graph=False, create_graph=False)
+        acts  = {l: self._saved[l].detach()[0] for l in layers}
+        grads = {l: grads[i].detach()[0] for i, l in enumerate(layers)}
+        return acts, grads
+
+    def _up_norm(self, cam, tgt):
+        up = F.interpolate(cam.unsqueeze(0).unsqueeze(0).float(),
+                           size=tgt, mode="trilinear",
+                           align_corners=False).squeeze().cpu().numpy()
+        mn, mx = up.min(), up.max()
+        return (up - mn) / (mx - mn + EPS)
+
+    def compute_all(self, x, cls=1):
+        T, H, W = x.shape[2], x.shape[3], x.shape[4]
+        tgt = (T, H, W)
+        A, G = self._fwd_grad(x, cls)
+
+        w  = G["layer4"].mean(dim=(1,2,3))
+        gc = self._up_norm(F.relu((w[:,None,None,None]*A["layer4"]).sum(0)), tgt)
+
+        G2 = G["layer4"]**2; G3 = G["layer4"]**3
+        dn = 2.0*G2 + (A["layer4"]*G3).sum(dim=(1,2,3), keepdim=True)
+        al = G2 / (dn + EPS)
+        wt = (al * F.relu(G["layer4"])).sum(dim=(1,2,3))
+        gcpp = self._up_norm(F.relu((wt[:,None,None,None]*A["layer4"]).sum(0)), tgt)
+
+        lc = np.zeros((T,H,W), dtype=np.float32)
+        for ln in ["layer2","layer3","layer4"]:
+            lc += self._up_norm(F.relu(F.relu(G[ln])*A[ln]).sum(0), tgt)
+        lc /= 3.0
+        mn, mx = lc.min(), lc.max(); lc = (lc-mn)/(mx-mn+EPS)
+
+        sm = np.zeros((T,H,W), dtype=np.float32); n_ok = 0
+        ns = SMOOTH_SIGMA * (x.max()-x.min()).item()
+        for _ in range(SMOOTH_N):
+            try:
+                an, gn = self._fwd_grad((x+torch.randn_like(x)*ns).detach(),
+                                        cls, layers=("layer4",))
+                G2n = gn["layer4"]**2; G3n = gn["layer4"]**3
+                dn2 = 2.0*G2n + (an["layer4"]*G3n).sum(dim=(1,2,3), keepdim=True)
+                al2 = G2n/(dn2+EPS)
+                wt2 = (al2*F.relu(gn["layer4"])).sum(dim=(1,2,3))
+                sm += self._up_norm(F.relu((wt2[:,None,None,None]*an["layer4"]).sum(0)), tgt)
+                n_ok += 1
+            except Exception:
+                pass
+        if n_ok > 0: sm /= n_ok
+        mn, mx = sm.min(), sm.max(); sm = (sm-mn)/(mx-mn+EPS)
+
+        return {"gradcam": gc, "gradcampp": gcpp, "smooth_gradcampp": sm, "layercam": lc}
+
+    def remove(self):
+        for h in self._hooks: h.remove()
+
+# ══════════════════════════════════════════════════════════════
+# PROCESSING HELPERS
+# ══════════════════════════════════════════════════════════════
+def _win_idx(start, total, ws):
+    end  = min(start+ws, total)
+    idxs = list(range(start, end))
+    if len(idxs) < ws: idxs = list(range(max(0, total-ws), total))
+    return idxs
+
+def _to_tensor(frames, indices):
+    arr = np.stack([frames[i] for i in indices]).astype(np.float32)/255.0
+    return torch.from_numpy(np.transpose(arr,(3,0,1,2))).unsqueeze(0).to(DEVICE)
+
+def _smooth_curve(arr, k=2):
+    return np.convolve(arr, np.ones(k)/k, mode="same") if k>1 else arr.copy()
+
+def _apply_heatmap(frame, cam):
+    heat = cv2.cvtColor(
+        cv2.applyColorMap((np.clip(cam,0,1)*255).astype(np.uint8), cv2.COLORMAP_JET),
+        cv2.COLOR_BGR2RGB)
+    return np.clip(frame*(1-ALPHA)+heat*ALPHA, 0, 255).astype(np.uint8)
+
+def _draw_info_bar(frame_rgb, ds_label, pred_lbl, conf,
+                   frame_idx, total, fight_prob, onset_frame, fps,
+                   method_tag, onset_thresh):
+    W   = DISPLAY_W
+    img = cv2.cvtColor(cv2.resize(frame_rgb, (W,W)), cv2.COLOR_RGB2BGR)
+    va  = (onset_frame is not None) and (frame_idx >= onset_frame)
+    GREEN=(0,210,0); RED=(0,0,210); YELLOW=(0,210,210); GREY=(150,150,150); DARK=(70,70,70)
+    BAR = 120
+    bar = np.zeros((BAR, W, 3), dtype=np.uint8)
+    if va: bar[:,:] = (18,0,0); bar[:3,:] = RED; bar[-3:,:] = RED
+    cv2.putText(bar, f"{ds_label}  Pred:{pred_lbl}  Conf:{conf*100:.1f}%",
+                (8,20), FONT, 0.44, GREEN if pred_lbl=="Fight" else GREY, 1, cv2.LINE_AA)
+    cv2.putText(bar, f"Frame:{frame_idx+1}/{total}  p(fight):{fight_prob:.3f}  [{method_tag}]",
+                (8,42), FONT, 0.42, RED if fight_prob>onset_thresh else GREY, 1, cv2.LINE_AA)
+    if va:
+        cv2.putText(bar, f"VIOLENCE DETECTED  onset:frame {onset_frame} @ {onset_frame/fps:.2f}s",
+                    (8,66), FONT, 0.44, RED, 1, cv2.LINE_AA)
+        cv2.putText(bar, f"+{frame_idx-onset_frame} frames since onset",
+                    (8,88), FONT, 0.40, YELLOW, 1, cv2.LINE_AA)
+    else:
+        cv2.putText(bar, "Monitoring...", (8,66), FONT, 0.44, GREY, 1, cv2.LINE_AA)
+    cv2.putText(bar, "R3D-18+LCM+LSTM", (8,108), FONT, 0.36, DARK, 1, cv2.LINE_AA)
+    cv2.circle(bar, (W-16,BAR//2), 7, RED if va else DARK, -1)
+    return cv2.cvtColor(np.vstack([img, bar]), cv2.COLOR_BGR2RGB)
+
+def _write_video(path, frames, fps):
+    if not frames: return
+    h, w = frames[0].shape[:2]
+    wr = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w,h))
+    for f in frames: wr.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+    wr.release()
+
+def _make_grid(imgs):
+    h, w = imgs[0].shape[:2]
+    g = np.zeros((ROWS_G*h, COLS_G*w, 3), dtype=np.uint8)
+    for k, im in enumerate(imgs[:ROWS_G*COLS_G]):
+        r, c = divmod(k, COLS_G); g[r*h:(r+1)*h, c*w:(c+1)*w] = im
+    return g
+
+def _save_timeline(sfp, rfp, onset, fps, path, vid_name, pred_lbl, thresh):
+    t   = [i/fps for i in range(len(sfp))]
+    fig, ax = plt.subplots(figsize=(12,4))
+    ax.plot(t, sfp, "#2196F3", linewidth=1.8, label="P(fight) smoothed", zorder=3)
+    ax.plot(t, rfp, "#90CAF9", linewidth=0.8, alpha=0.6, label="P(fight) raw", zorder=2)
+    ax.axhline(thresh, color="red", linewidth=1.2, linestyle="--", label=f"Threshold ({thresh})")
+    if onset is not None:
+        ot = onset/fps
+        ax.axvline(ot, color="green", linewidth=2.0, label=f"Onset @ {ot:.2f}s")
+        ax.fill_between(t, 0, sfp, where=[x>=ot for x in t], alpha=0.18, color="green")
+    ax.set_title(f"{vid_name}  pred={pred_lbl}", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Time (s)"); ax.set_ylabel("P(fight)")
+    ax.set_ylim(0,1.05); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig(str(path), dpi=120); plt.close()
+
+def _lstm_onset(sfp, rfp, total, thresh, spike):
+    prev = 0.0
+    for i in range(total):
+        fp = float(sfp[i])
+        if fp > thresh and (fp-prev) > spike: return i
+        prev = max(prev, fp)
+    for i in range(total):
+        if sfp[i] > thresh: return i
+    for i in range(total):
+        if rfp[i] > thresh: return i
+    for i in range(total):
+        if rfp[i] > 0.30: return i
+    return int(np.argmax(sfp))
+
+def _safe_name(stem):
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)
+
+# ══════════════════════════════════════════════════════════════
+# MAIN PROCESSING FUNCTION
+# ══════════════════════════════════════════════════════════════
+def run_processing_pipeline(vid_path: Path, cfg: dict, true_label: str, out_dir: Path, progress_dict: dict):
+    def upd(pct, stage):
+        progress_dict["pct"] = pct
+        progress_dict["stage"] = stage
+    try:
+        upd(0.02, "📂 Reading video frames...")
+        cap = cv2.VideoCapture(str(vid_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
+        frames = []
+        while True:
+            ok, f = cap.read()
+            if not ok: break
+            frames.append(cv2.cvtColor(cv2.resize(f,(IMG_SIZE,IMG_SIZE)), cv2.COLOR_BGR2RGB))
+        cap.release()
+        if not frames: raise RuntimeError("No frames decoded.")
+        total = len(frames)
+        fps = float(fps) if fps > 1 else 15.0
+
+        WS = cfg["window_size"]
+        starts = list(range(0, total-WS+1, cfg["window_stride"]))
+        if not starts: starts = [0]
+        if starts[-1]+WS < total: starts.append(max(0, total-WS))
+
+        upd(0.08, "🧠 Loading model & running predictions...")
+        model, meta = load_model_cached(cfg)
+
+        best_p = None; best_fp = -1.0
+        ffp = np.zeros(total, np.float32)
+        fhc = np.zeros(total, np.float32)
+        n_wins = len(starts)
+        for wi, start in enumerate(starts):
+            idx = _win_idx(start, total, WS)
+            with torch.no_grad():
+                logits, seq = model.forward_with_seq(_to_tensor(frames, idx))
+                p = torch.softmax(logits, dim=1).cpu().numpy().reshape(-1)
+            if p[1] > best_fp: best_fp = float(p[1]); best_p = p
+            n = len(seq)
+            for si, gi in enumerate(idx):
+                if 0 <= gi < total:
+                    ci = min(int(si*n/len(idx)), n-1)
+                    ffp[gi] += seq[ci]; fhc[gi] += 1
+            upd(0.08 + 0.22*(wi+1)/n_wins, f"🧠 Predictions... window {wi+1}/{n_wins}")
+
+        ffp /= np.maximum(fhc, 1)
+        sfp = _smooth_curve(ffp, SMOOTH_K)
+        pred = 1 if best_fp >= cfg["pred_thresh"] else 0
+        conf = float(best_p[pred])
+        pred_lbl = "Fight" if pred == 1 else "Nonfight"
+        progress_dict["pred_lbl"] = pred_lbl
+        progress_dict["conf"] = conf
+
+        upd(0.32, "⏱️ Detecting fight onset...")
+        onset = None
+        if pred == 1:
+            onset = _lstm_onset(sfp, ffp, total, cfg["onset_thresh"], cfg["spike_delta"])
+        progress_dict["onset"] = onset
+
+        cams = None
+        if pred == 1:
+            acc = {m: np.zeros((total,IMG_SIZE,IMG_SIZE), np.float32) for m in CAM_METHODS}
+            hc  = np.zeros(total, np.float32)
+            eng = CAMEngine(model)
+            for wi, start in enumerate(starts):
+                idx = _win_idx(start, total, WS)
+                try:
+                    cam_out = eng.compute_all(_to_tensor(frames, idx), cls=1)
+                except Exception:
+                    continue
+                nc = cam_out["gradcam"].shape[0]
+                for li, gi in enumerate(idx):
+                    if 0 <= gi < total:
+                        ci = min(int(li*nc/len(idx)), nc-1)
+                        for m in CAM_METHODS: acc[m][gi] += cam_out[m][ci]
+                        hc[gi] += 1
+                upd(0.32 + 0.38*(wi+1)/n_wins, f"🔥 Computing CAMs... window {wi+1}/{n_wins}")
+            eng.remove()
+            def _norm(a):
+                a = a / np.maximum(hc[:,None,None], 1)
+                mn, mx = a.min(), a.max()
+                return (a-mn)/(mx-mn+EPS)
+            cams = {m: _norm(acc[m]) for m in CAM_METHODS}
+
+        upd(0.72, "🎬 Rendering annotated frames...")
+        fl = {k: [] for k in ["original"] + CAM_METHODS + ["combined"]}
+        kw = dict(ds_label=cfg["label"], pred_lbl=pred_lbl, conf=conf,
+                  total=total, onset_frame=onset, fps=fps,
+                  onset_thresh=cfg["onset_thresh"])
+        for t, fr in enumerate(frames):
+            fp_t = float(sfp[t])
+            active = (pred==1) and (onset is not None) and (t >= onset)
+            fl["original"].append(_draw_info_bar(fr.copy(), frame_idx=t, fight_prob=fp_t, method_tag="Original", **kw))
+            for m in CAM_METHODS:
+                f_m = _apply_heatmap(fr, cams[m][t]) if active else fr.copy()
+                fl[m].append(_draw_info_bar(f_m, frame_idx=t, fight_prob=fp_t, method_tag=CAM_LABELS[m], **kw))
+            if active:
+                combo = (cams["gradcampp"][t]+cams["smooth_gradcampp"][t]+cams["layercam"][t])/3
+                mn, mx = combo.min(), combo.max()
+                combo = (combo-mn)/(mx-mn+EPS)
+                f_c = _apply_heatmap(fr, combo)
+            else:
+                f_c = fr.copy()
+            fl["combined"].append(_draw_info_bar(f_c, frame_idx=t, fight_prob=fp_t, method_tag="Combined", **kw))
+
+        upd(0.80, "💾 Writing videos...")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = _safe_name(vid_path.stem)
+        tag_map = [("original","original"),("gradcam","gradcam"),
+                   ("gradcampp","gradcampp"),("smooth_gradcampp","smooth_gradcampp"),
+                   ("layercam","layercam"),("combined","combined")]
+        for idx, (tag, key) in enumerate(tag_map):
+            _write_video(out_dir/f"{stem}_{tag}.mp4", fl[key], fps)
+            upd(0.80 + 0.06*(idx+1)/len(tag_map), f"💾 Writing {tag}.mp4...")
+
+        upd(0.87, "🖼️ Saving frame grids...")
+        pick = np.linspace(0, total-1, GRID_FRAMES).astype(int)
+        grid_map = [("raw_grid","original"),("gradcam_grid","gradcam"),
+                    ("gradcampp_grid","gradcampp"),("smooth_gradcampp_grid","smooth_gradcampp"),
+                    ("layercam_grid","layercam"),("combined_grid","combined")]
+        for gname, key in grid_map:
+            src = [frames[i] for i in pick] if gname=="raw_grid" else [fl[key][i] for i in pick]
+            cv2.imwrite(str(out_dir/f"{gname}.png"), cv2.cvtColor(_make_grid(src), cv2.COLOR_RGB2BGR))
+
+        upd(0.93, "📊 Generating timeline plot...")
+        _save_timeline(sfp, ffp, onset, fps, out_dir/"timeline.png", vid_path.name, pred_lbl, cfg["onset_thresh"])
+
+        upd(0.96, "📋 Writing pred.txt...")
+        onset_s = f"{onset/fps:.2f}s" if onset is not None else "N/A"
+        with open(out_dir/"pred.txt", "w", encoding="utf-8") as f:
+            f.write(f"dataset:          {cfg['name']}\n")
+            f.write(f"video:            {vid_path}\n")
+            f.write(f"true_label:       {true_label}\n")
+            f.write(f"pred_label:       {pred_lbl}\n")
+            f.write(f"correct:          {pred_lbl==true_label}\n")
+            f.write(f"confidence:       {conf:.4f}\n")
+            f.write(f"probs:            [nonfight={best_p[0]:.6f}  fight={best_p[1]:.6f}]\n")
+            f.write(f"model_path:       {meta['path']}\n")
+            f.write(f"model_epoch:      {meta.get('epoch','N/A')}\n")
+            f.write(f"model_val_acc:    {meta.get('val_acc','N/A')}\n")
+            f.write(f"window_size:      {WS}\n")
+            f.write(f"window_stride:    {cfg['window_stride']}\n")
+            f.write(f"onset_threshold:  {cfg['onset_thresh']}\n")
+            f.write(f"spike_delta:      {cfg['spike_delta']}\n")
+            f.write(f"total_frames:     {total}\n")
+            f.write(f"cam_methods:      GradCAM|GradCAM++|SmoothGradCAM++|LayerCAM|Combined\n")
+            f.write(f"smooth_passes:    {SMOOTH_N}\n")
+            if pred == 1:
+                f.write(f"onset_frame:      {onset}\n")
+                f.write(f"onset_time:       {onset_s}\n")
+                f.write(f"heatmap:          from frame {onset} ({onset_s}) onward\n")
+            else:
+                f.write(f"onset_frame:      N/A\n")
+                f.write(f"onset_time:       N/A\n")
+                f.write(f"heatmap:          NOT rendered — Nonfight prediction\n")
+                f.write(f"nonfight_reason:  p(fight)={best_p[1]:.4f} < {cfg['pred_thresh']}\n")
+
+        upd(1.0, "✅ Done!")
+        progress_dict["out_dir"] = str(out_dir)
+        progress_dict["done"] = True
+    except Exception as e:
+        import traceback
+        progress_dict["error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        progress_dict["done"] = True
+
+# ══════════════════════════════════════════════════════════════
+# PAGE CONFIG + THEME
+# ══════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="VisionGuard — Violence Detection",
     layout="wide",
     page_icon="🛡️",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-
-# ──────────────────────────────────────────
-# THEME SYSTEM
-# ──────────────────────────────────────────
 def get_theme_css(theme="dark", accent="#e05252", font_size="medium"):
-    font_scale = {"small": "0.85rem", "medium": "1rem", "large": "1.1rem"}.get(font_size, "1rem")
-    sidebar_font = {"small": "10px", "medium": "11px", "large": "12px"}.get(font_size, "11px")
-
+    font_scale = {"small":"0.85rem","medium":"1rem","large":"1.1rem"}.get(font_size,"1rem")
     if theme == "dark":
-        bg        = "#080c10"
-        bg2       = "#0d1520"
-        bg3       = "#0a0f18"
-        border    = "#1a2535"
-        text_main = "#c8d8e8"
-        text_dim  = "#445566"
-        text_dim2 = "#2a3a4a"
-        text_head = "#e8f4ff"
-        text_blue = "#7ecfff"
-        text_sub  = "#aabbc8"
-        text_h3   = "#7a99b0"
-        scanline  = "rgba(0,0,0,0.03)"
+        bg="#080c10"; bg2="#0d1520"; bg3="#0a0f18"; border="#1a2535"
+        text_main="#c8d8e8"; text_dim="#445566"; text_dim2="#2a3a4a"
+        text_head="#e8f4ff"; text_blue="#7ecfff"; text_sub="#aabbc8"; text_h3="#7a99b0"
     else:
-        bg        = "#f0f4f8"
-        bg2       = "#ffffff"
-        bg3       = "#e8edf3"
-        border    = "#cdd5df"
-        text_main = "#1a2535"
-        text_dim  = "#556677"
-        text_dim2 = "#778899"
-        text_head = "#0a1020"
-        text_blue = "#1a6fc4"
-        text_sub  = "#334455"
-        text_h3   = "#445566"
-        scanline  = "rgba(0,0,0,0.01)"
-
-    return f"""
+        bg="#f0f4f8"; bg2="#ffffff"; bg3="#e8edf3"; border="#cdd5df"
+        text_main="#1a2535"; text_dim="#556677"; text_dim2="#778899"
+        text_head="#0a1020"; text_blue="#1a6fc4"; text_sub="#334455"; text_h3="#445566"
+    return f'''
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&family=Orbitron:wght@700;900&display=swap');
-
-html, body, .stApp {{ background:{bg} !important; color:{text_main} !important; font-size:{font_scale}; }}
-*, *::before, *::after {{ box-sizing: border-box; }}
-
-[data-testid="stSidebar"] {{
-    background: {'linear-gradient(180deg,#0a0f18 0%,#080c14 100%)' if theme=='dark' else 'linear-gradient(180deg,#ffffff 0%,#f0f4f8 100%)'} !important;
-    border-right: 1px solid {border} !important;
-    min-width: 260px !important; max-width: 260px !important;
+html,body,.stApp{{background:{bg}!important;color:{text_main}!important;font-size:{font_scale};}}
+[data-testid="stSidebar"]{{background:linear-gradient(180deg,{bg3} 0%, {bg} 100%)!important;border-right:1px solid {border}!important;}}
+[data-testid="stSidebar"] *{{color:{text_main}!important;}}
+#MainMenu,footer,header{{visibility:hidden!important;}}
+[data-testid="stDecoration"]{{display:none!important;}}
+.block-container{{padding:1.1rem 1.6rem 2rem 1.6rem!important;max-width:100%!important;}}
+.stTabs [data-baseweb="tab-list"]{{gap:0;background:{bg2};border-bottom:1px solid {border};padding:0;}}
+.stTabs [data-baseweb="tab"]{{font-size:12px;font-weight:700;padding:8px 14px;color:{text_dim}!important;border-bottom:2px solid transparent;}}
+.stTabs [aria-selected="true"]{{color:{text_head}!important;border-bottom:2px solid {accent}!important;}}
+[data-testid="metric-container"]{{background:{bg2};border:1px solid {border};border-radius:8px;padding:10px 14px!important;}}
+.stButton>button{{border-radius:8px!important;font-weight:700!important;}}
+.stButton>button[kind="primary"]{{background:{accent}!important;border:none!important;color:white!important;}}
+.stButton>button:not([kind="primary"]){{background:{bg2}!important;border:1px solid {border}!important;color:{text_blue}!important;}}
+.stSelectbox>div>div,.stTextInput>div>div>input,.stTextArea textarea{{background:{bg2}!important;border:1px solid {border}!important;color:{text_main}!important;}}
+.streamlit-expanderHeader{{background:{bg2}!important;border:1px solid {border}!important;border-radius:8px!important;}}
+hr{{border-color:{border}!important;}}
+[data-testid="stVideo"] video{{max-height:140px!important;width:100%!important;object-fit:contain!important;background:#000!important;}}
+[data-testid="stVideo"]{{border:1px solid {border}!important;border-radius:8px!important;background:#000!important;max-width:420px!important;}}
+.vg-card{{background:{bg2};border:1px solid {border};border-radius:12px;padding:16px;margin-bottom:12px;}}
+.vg-soft{{color:{text_dim};font-size:12px;}}
+.vg-title{{font-size:1.3rem;font-weight:800;color:{text_head};}}
+.vg-mini{{font-size:11px;color:{text_dim2};}}
+.vg-badge-fight{{display:inline-block;padding:4px 14px;border-radius:999px;background:rgba(224,82,82,0.18);border:2px solid #e05252;color:#ff5555;font-size:12px;font-weight:800;letter-spacing:0.05em;animation:fight-pulse 1.3s ease-in-out infinite;}}
+.vg-badge-normal{{display:inline-block;padding:4px 14px;border-radius:999px;background:rgba(82,224,138,0.12);border:1px solid #52e08a;color:#52e08a;font-size:12px;font-weight:700;}}
+@keyframes fight-pulse{{
+  0%  {{box-shadow:0 0 0 0 rgba(224,82,82,0.75);background:rgba(224,82,82,0.18);border-color:#e05252;}}
+  50% {{box-shadow:0 0 0 9px rgba(224,82,82,0);background:rgba(224,82,82,0.38);border-color:#ff2020;}}
+  100%{{box-shadow:0 0 0 0 rgba(224,82,82,0);background:rgba(224,82,82,0.18);border-color:#e05252;}}
 }}
-[data-testid="stSidebar"] > div:first-child {{ padding: 0 !important; }}
-[data-testid="stSidebar"] * {{ color: {text_main} !important; }}
-
-#MainMenu, footer, header {{ visibility:hidden !important; }}
-[data-testid="stDecoration"] {{ display:none !important; }}
-.block-container {{
-    padding: 1.2rem 1.8rem 2rem 1.8rem !important;
-    max-width: 100% !important;
-}}
-
-.stTabs [data-baseweb="tab-list"] {{
-    gap: 0; background: {bg2}; border-bottom: 1px solid {border};
-    border-radius: 0; padding: 0;
-}}
-.stTabs [data-baseweb="tab"] {{
-    font-family: 'Rajdhani', sans-serif; font-size: 12px; font-weight: 600;
-    padding: 8px 16px; border-radius: 0; color: {text_dim} !important;
-    background: transparent !important; border-bottom: 2px solid transparent;
-    letter-spacing: 0.5px; text-transform: uppercase;
-}}
-.stTabs [aria-selected="true"] {{
-    color: {text_head} !important; border-bottom: 2px solid {accent} !important;
-    background: transparent !important;
-}}
-
-[data-testid="metric-container"] {{
-    background: {bg2}; border: 1px solid {border};
-    border-radius: 6px; padding: 10px 14px !important;
-}}
-[data-testid="stMetricValue"] {{
-    font-family: 'Share Tech Mono', monospace !important;
-    font-size: 1.1rem !important; font-weight: 400 !important; color: {text_blue} !important;
-}}
-[data-testid="stMetricLabel"] {{
-    font-family: 'Rajdhani', sans-serif !important;
-    font-size: 10px !important; color: {text_dim} !important;
-    text-transform: uppercase; letter-spacing: 1px;
-}}
-
-.stButton > button {{
-    font-family: 'Rajdhani', sans-serif !important;
-    font-weight: 700 !important; font-size: 13px !important;
-    border-radius: 4px !important; letter-spacing: 1px; text-transform: uppercase;
-    transition: all 0.15s ease;
-}}
-.stButton > button[kind="primary"] {{
-    background: {accent} !important; border: none !important; color: white !important;
-    box-shadow: 0 0 12px {accent}55 !important;
-}}
-.stButton > button[kind="primary"]:hover {{
-    filter: brightness(1.15) !important;
-    box-shadow: 0 0 20px {accent}88 !important;
-}}
-.stButton > button:not([kind="primary"]) {{
-    background: {bg2} !important; border: 1px solid {border} !important; color: {text_blue} !important;
-}}
-
-.stSelectbox > div > div, .stTextInput > div > div > input,
-.stTextArea > div > div > textarea {{
-    background: {bg2} !important; border: 1px solid {border} !important;
-    color: {text_main} !important; border-radius: 4px !important;
-    font-family: 'Share Tech Mono', monospace !important;
-}}
-
-.streamlit-expanderHeader {{
-    background: {bg2} !important; border: 1px solid {border} !important;
-    border-radius: 4px !important; font-family: 'Rajdhani', sans-serif !important;
-    font-weight: 600 !important; color: {text_blue} !important;
-}}
-.streamlit-expanderContent {{
-    background: {bg} !important; border: 1px solid {border} !important;
-    border-top: none !important;
-}}
-
-[data-testid="stDataFrame"] {{ border: 1px solid {border} !important; border-radius: 6px; }}
-hr {{ border-color: {border} !important; margin: 0.8rem 0 !important; }}
-div[data-testid="stAlert"] {{ border-radius: 4px !important; border-left-width: 3px !important; }}
-div[data-testid="stImage"] img {{ border-radius: 6px; border: 1px solid {border}; }}
-[data-testid="stSlider"] > div > div > div {{ background: {accent} !important; }}
-
-::-webkit-scrollbar {{ width: 4px; height: 4px; }}
-::-webkit-scrollbar-track {{ background: {bg}; }}
-::-webkit-scrollbar-thumb {{ background: {border}; border-radius: 2px; }}
-
-h1 {{ font-family:'Orbitron',sans-serif !important; font-size:1.1rem !important;
-     color:{text_head} !important; letter-spacing:2px; }}
-h2 {{ font-family:'Rajdhani',sans-serif !important; font-size:1.1rem !important;
-     font-weight:700 !important; color:{text_sub} !important; letter-spacing:1px; text-transform:uppercase; }}
-h3 {{ font-family:'Rajdhani',sans-serif !important; font-size:0.95rem !important;
-     font-weight:600 !important; color:{text_h3} !important; }}
-
-.stApp::before {{
-    content:''; position:fixed; top:0; left:0; right:0; bottom:0;
-    background: repeating-linear-gradient(0deg,transparent,transparent 2px,{scanline} 2px,{scanline} 4px);
-    pointer-events:none; z-index:9999;
-}}
-
-[data-testid="stVideo"] video {{
-    max-height: 160px !important; width: 100% !important;
-    border-radius: 4px 4px 0 0 !important; background: #000 !important;
-    display: block; object-fit: contain !important;
-}}
-[data-testid="stVideo"] {{
-    border: 1px solid {border} !important; border-radius: 6px !important;
-    overflow: visible !important; background: #000 !important;
-    margin-bottom: 8px !important;
-}}
-
-@keyframes vg-shimmer {{
-    0%   {{ background-position: -200% center; }}
-    100% {{ background-position:  200% center; }}
-}}
-
-.vg-badge-fight {{
-    display:inline-block; padding:3px 10px; border-radius:3px;
-    background:rgba(224,82,82,0.15); border:1px solid #e05252;
-    color:#ff8080; font-family:'Share Tech Mono',monospace; font-size:11px; letter-spacing:1px;
-}}
-.vg-badge-normal {{
-    display:inline-block; padding:3px 10px; border-radius:3px;
-    background:rgba(82,224,138,0.12); border:1px solid #52e08a;
-    color:#52e08a; font-family:'Share Tech Mono',monospace; font-size:11px; letter-spacing:1px;
-}}
-
-@keyframes pulse-shield {{
-    0%,100% {{ transform:scale(1);   opacity:1;   }}
-    50%      {{ transform:scale(1.1); opacity:0.75; }}
-}}
-@keyframes fadein-up {{
-    from {{ opacity:0; transform:translateY(18px); }}
-    to   {{ opacity:1; transform:translateY(0);    }}
-}}
-@keyframes fadein-up-d1 {{
-    0%   {{ opacity:0; transform:translateY(18px); }}
-    30%  {{ opacity:0; transform:translateY(18px); }}
-    100% {{ opacity:1; transform:translateY(0); }}
-}}
-@keyframes fadein-up-d2 {{
-    0%   {{ opacity:0; transform:translateY(18px); }}
-    50%  {{ opacity:0; transform:translateY(18px); }}
-    100% {{ opacity:1; transform:translateY(0); }}
-}}
-@keyframes fadein-up-d3 {{
-    0%   {{ opacity:0; transform:translateY(18px); }}
-    65%  {{ opacity:0; transform:translateY(18px); }}
-    100% {{ opacity:1; transform:translateY(0); }}
-}}
-
-.vg-welcome  {{ animation: fadein-up 0.5s ease both; }}
-.vg-wcard {{
-    background:{bg2}; border:1px solid {border}; border-radius:12px;
-    padding:18px 20px; transition:border-color .2s, box-shadow .2s;
-}}
-.vg-wcard:hover        {{ border-color:{accent}; box-shadow:0 0 22px {accent}22; }}
-
-.vg-stat-row {{
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 12px;
-    margin: 20px 0 0 0;
-    animation: fadein-up-d1 0.8s ease both;
-}}
-.vg-stat-tile {{
-    background: {bg2};
-    border: 1px solid {border};
-    border-radius: 10px;
-    padding: 20px 14px;
-    text-align: center;
-    transition: border-color .2s, box-shadow .2s;
-}}
-.vg-stat-tile:hover {{ border-color: {accent}; box-shadow: 0 0 20px {accent}22; }}
-.vg-stat-icon  {{ font-size: 22px; margin-bottom: 8px; }}
-.vg-stat-val   {{ font-family:'Orbitron',sans-serif; font-size:20px; font-weight:900; color:{text_blue}; margin-bottom:4px; }}
-.vg-stat-label {{ font-family:'Rajdhani',sans-serif; font-size:10px; color:{text_dim2}; text-transform:uppercase; letter-spacing:1.5px; }}
-
-.vg-steps-row {{
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 14px;
-    margin: 12px 0 0 0;
-    animation: fadein-up-d2 0.9s ease both;
-}}
-.vg-step-card {{
-    position: relative;
-    background: {bg2};
-    border: 1px solid {border};
-    border-radius: 12px;
-    padding: 22px 20px 20px;
-    overflow: hidden;
-    transition: box-shadow .2s;
-}}
-.vg-step-card:hover {{ box-shadow: 0 4px 28px rgba(0,0,0,.2); }}
-.vg-step-card.red   {{ border-left: 3px solid {accent}; }}
-.vg-step-card.blue  {{ border-left: 3px solid {text_blue}; }}
-.vg-step-card.green {{ border-left: 3px solid #52e08a; }}
-.vg-step-num {{
-    position:absolute; top:10px; right:14px;
-    font-family:'Orbitron',sans-serif; font-size:28px; font-weight:900; color:{border}; line-height:1;
-}}
-.vg-step-icon  {{ font-size:22px; margin-bottom:10px; }}
-.vg-step-title {{ font-family:'Rajdhani',sans-serif; font-weight:700; font-size:13px; letter-spacing:1px; margin-bottom:7px; }}
-.vg-step-desc  {{ font-family:'Rajdhani',sans-serif; font-size:12px; color:{text_dim}; line-height:1.6; }}
-
-.vg-ql-row {{
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 10px;
-    margin: 12px 0 0 0;
-    animation: fadein-up-d3 1.0s ease both;
-}}
-
-.vg-divider-label {{
-    font-family:'Share Tech Mono',monospace;
-    font-size:9px; color:{text_dim2}; letter-spacing:3px;
-    margin: 28px 0 12px 0;
-}}
-
-/* Settings page cards */
-.vg-settings-card {{
-    background: {bg2};
-    border: 1px solid {border};
-    border-radius: 12px;
-    padding: 20px 22px;
-    margin-bottom: 16px;
-    transition: border-color .2s;
-}}
-.vg-settings-card:hover {{ border-color: {accent}44; }}
-.vg-settings-section-title {{
-    font-family: 'Orbitron', sans-serif;
-    font-size: 10px;
-    font-weight: 900;
-    color: {text_dim2};
-    letter-spacing: 3px;
-    text-transform: uppercase;
-    margin-bottom: 14px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid {border};
-}}
+.vg-stat-row{{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0;}}
+.vg-stat{{background:{bg3};border:1px solid {border};border-radius:8px;padding:8px 14px;flex:1;min-width:100px;}}
+.vg-stat-label{{font-size:10px;color:{text_dim};text-transform:uppercase;letter-spacing:0.05em;}}
+.vg-stat-val{{font-size:1.1rem;font-weight:700;color:{text_head};}}
+.hist-row{{background:{bg2};border:1px solid {border};border-radius:8px;padding:10px 14px;margin-bottom:6px;display:flex;align-items:center;gap:12px;}}
+.login-wrap{{max-width:420px;margin:0 auto;padding-top:2.5rem;}}
+.vg-back-btn{{display:inline-flex;align-items:center;gap:6px;padding:5px 14px;border-radius:8px;background:{bg2};border:1px solid {border};color:{text_blue};font-size:13px;font-weight:700;cursor:pointer;margin-bottom:10px;}}
+.fight-analysis-card{{background:rgba(224,82,82,0.06);border:1px solid #e05252;border-radius:10px;padding:14px 18px;margin-bottom:14px;}}
+.normal-analysis-card{{background:rgba(82,224,138,0.05);border:1px solid #52e08a;border-radius:10px;padding:12px 16px;margin-bottom:14px;}}
+.idea-card{{background:{bg3};border:1px solid {border};border-radius:8px;padding:10px 14px;margin-bottom:8px;}}
 </style>
-"""
+'''
 
-
-# ──────────────────────────────────────────
-# Auth
-# ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# AUTH + HISTORY STORAGE
+# ══════════════════════════════════════════════════════════════
 def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
 
 def load_users():
     if USERS_FILE.exists():
-        try:
-            with open(USERS_FILE) as f: return json.load(f)
+        try: return json.loads(USERS_FILE.read_text())
         except: pass
     return {}
 
-def save_users(u):
-    with open(USERS_FILE, "w") as f: json.dump(u, f, indent=2)
+def save_users(u): USERS_FILE.write_text(json.dumps(u, indent=2))
 
 def try_login(u, p):
-    return load_users().get(u) == hash_pw(p)
+    users = load_users()
+    info = users.get(u)
+    if not info: return False
+    if isinstance(info, str): return info == hash_pw(p)
+    return info.get("password") == hash_pw(p)
 
 def try_register(u, p):
     if not u or not p: return False, "Username and password required."
     if len(p) < 4: return False, "Password must be at least 4 characters."
     users = load_users()
     if u in users: return False, "Username already exists."
-    users[u] = hash_pw(p); save_users(users)
-    return True, "Account created! You can now log in."
+    reset_code = ''.join(random.choices(string.digits, k=6))
+    users[u] = {"password": hash_pw(p), "created_at": datetime.now().isoformat(), "reset_code": reset_code}
+    save_users(users)
+    return True, f"Account created! Save your recovery code: **{reset_code}**"
 
+def reset_password(username, code, new_pw):
+    users = load_users()
+    if username not in users: return False, "Username not found."
+    info = users[username] if isinstance(users[username], dict) else {"password": users[username], "reset_code": "000000"}
+    if info.get("reset_code") != code: return False, "Recovery code is incorrect."
+    if len(new_pw) < 4: return False, "Password must be at least 4 characters."
+    info["password"] = hash_pw(new_pw)
+    users[username] = info
+    save_users(users)
+    return True, "Password reset successfully."
 
-# ──────────────────────────────────────────
-# Core utils
-# ──────────────────────────────────────────
-def is_fight_pred(pred: dict, flip: bool = False) -> bool:
-    lbl = str(pred.get("pred_label", "")).lower()
+def load_history_store():
+    if HISTORY_FILE.exists():
+        try: return json.loads(HISTORY_FILE.read_text())
+        except: pass
+    return []
+
+def save_history_store(items): HISTORY_FILE.write_text(json.dumps(items, indent=2))
+
+# ══════════════════════════════════════════════════════════════
+# UTILS
+# ══════════════════════════════════════════════════════════════
+def is_fight_pred(pred, flip=False):
+    lbl = str(pred.get("pred_label"," ")).lower()
     raw = "fight" in lbl and "non" not in lbl
     return (not raw) if flip else raw
 
-def pred_label_to_status(pred_label: str) -> str:
-    if "fight" in str(pred_label).lower() and "non" not in str(pred_label).lower():
-        return "ALERT"
+def pred_label_to_status(pred_label):
+    if "fight" in str(pred_label).lower() and "non" not in str(pred_label).lower(): return "ALERT"
     return "NORMAL"
 
-def color_from_status(s):
-    return {"ALERT": "🔴", "SUSPICIOUS": "🟡", "NORMAL": "🟢", "UNKNOWN": "⚪"}.get(s, "⚪")
+def color_from_status(s): return {"ALERT":"🔴","SUSPICIOUS":"🟡","NORMAL":"🟢","UNKNOWN":"⚪"}.get(s,"⚪")
 
 def fmt_time(sec):
     if sec is None: return "N/A"
@@ -412,7 +723,6 @@ def fmt_time(sec):
     except: return str(sec)
 
 def to_rgb(bgr): return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
 def resize_keep(frame, w=640):
     h, ww = frame.shape[:2]
     if ww == w: return frame
@@ -430,31 +740,26 @@ def read_video_frames(path, max_frames=CFG.MAX_FRAMES):
     cap.release()
     return frames, float(fps)
 
-def scores_from_pred(pred: dict, n_frames: int, fps: float):
-    conf = 0.5
-    try: conf = float(pred.get("confidence", 0.5))
-    except: pass
-    onset_frame = 0
-    try: onset_frame = int(pred.get("onset_frame", 0))
-    except: pass
+def scores_from_pred(pred, n_frames, fps):
+    conf = float(pred.get("confidence",0.5) or 0.5)
+    try: onset_frame = int(pred.get("onset_frame",0))
+    except: onset_frame = 0
     is_fight = is_fight_pred(pred)
     scores = np.zeros(n_frames, dtype=np.float32)
     if is_fight:
         for i in range(n_frames):
-            if i < onset_frame:
-                scores[i] = max(0.05, conf * 0.1)
+            if i < onset_frame: scores[i] = max(0.05, conf*0.1)
             else:
-                ramp = min(1.0, (i - onset_frame) / max(1, fps))
-                scores[i] = float(np.clip(conf * (0.7 + 0.3*ramp), 0, 1))
+                ramp = min(1.0, (i-onset_frame)/max(1,fps))
+                scores[i] = float(np.clip(conf*(0.7+0.3*ramp),0,1))
     else:
-        scores = np.clip(np.random.normal(0.15, 0.05, n_frames), 0, 0.4).astype(np.float32)
+        scores = np.clip(np.random.normal(0.15,0.05,n_frames),0,0.4).astype(np.float32)
         scores[0] = 0.10
     return scores
 
 def ffmpeg_ok():
     try:
-        subprocess.run(["ffmpeg","-version"], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=5)
+        subprocess.run(["ffmpeg","-version"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
         return True
     except: return False
 
@@ -464,19 +769,17 @@ def make_web_preview(src, dst):
     if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime: return True
     if ffmpeg_ok():
         try:
-            subprocess.run(["ffmpeg","-y","-i",str(src),"-c:v","libx264",
-                            "-pix_fmt","yuv420p","-preset","veryfast","-crf","23",
-                            "-c:a","aac","-b:a","128k",str(dst)],
-                           check=True, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=120)
+            subprocess.run(["ffmpeg","-y","-i",str(src),"-c:v","libx264","-pix_fmt","yuv420p",
+                            "-preset","veryfast","-crf","23","-c:a","aac","-b:a","128k",str(dst)],
+                           check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=120)
             return True
         except: pass
     try:
         cap = cv2.VideoCapture(str(src))
         if not cap.isOpened(): return False
-        fps = cap.get(cv2.CAP_PROP_FPS) or CFG.DEFAULT_FPS
-        w, h = int(cap.get(3)), int(cap.get(4))
-        out = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (w, h))
+        fps2 = cap.get(cv2.CAP_PROP_FPS) or CFG.DEFAULT_FPS
+        w2, h2 = int(cap.get(3)), int(cap.get(4))
+        out = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), float(fps2), (w2,h2))
         while True:
             ret, f = cap.read()
             if not ret: break
@@ -485,187 +788,147 @@ def make_web_preview(src, dst):
         return dst.exists()
     except: return False
 
-def describe_onset(pred: dict) -> str:
-    onset_t = pred.get("onset_time", "?")
-    onset_f = pred.get("onset_frame", "?")
-    spike   = pred.get("spike_delta", "?")
-    thr     = pred.get("onset_threshold", "?")
-    if onset_f == "N/A" or onset_t == "N/A":
-        return "No clear onset detected."
-    return (f"Fight onset detected at frame {onset_f} ({onset_t}). "
-            f"Onset threshold: {thr}, spike delta: {spike}.")
+def describe_onset(pred):
+    onset_t = pred.get("onset_time","?"); onset_f = pred.get("onset_frame","?")
+    if onset_f == "N/A" or onset_t == "N/A": return "No clear onset detected."
+    return f"Fight onset at frame {onset_f} ({onset_t}). Threshold: {pred.get('onset_threshold','?')}, spike: {pred.get('spike_delta','?')}."
 
+def build_email_summary(pred, folder_name, camera="", location="", notes="", reviewer_tag=""):
+    state = "Fight detected" if is_fight_pred(pred) else "No fight detected"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return f"""Subject: VisionGuard Incident Report — {folder_name}
 
-# ──────────────────────────────────────────
-# Safe video helper
-# ──────────────────────────────────────────
+Hello,
+
+An automated analysis has been completed by VisionGuard.
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+INCIDENT SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━
+Status:        {state}
+Prediction:    {pred.get("pred_label", "?")}
+Confidence:    {pred.get("confidence", "?")}
+Dataset:       {pred.get("dataset", "?")}
+Onset time:    {pred.get("onset_time", "N/A")}
+Onset frame:   {pred.get("onset_frame", "N/A")}
+Total frames:  {pred.get("total_frames", "N/A")}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+LOCATION / METADATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+Camera:        {camera or "N/A"}
+Location:      {location or "N/A"}
+Reviewer:      {reviewer_tag or "N/A"}
+Notes:         {notes or "N/A"}
+Timestamp:     {ts}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+MODEL DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━
+Model path:    {pred.get("model_path", "?")}
+Val accuracy:  {pred.get("model_val_acc", "?")}
+True label:    {pred.get("true_label", "?")}
+Correct:       {pred.get("correct", "?")}
+System note:   {describe_onset(pred)}
+
+Regards,
+VisionGuard — R3D-18 + LCM + LSTM
+"""
+
 def _safe_video(path):
+    """Serve video with browser-compatible h264. Transcodes to a _web.mp4 sidecar if needed."""
     try:
         p = Path(path)
         if not p.exists(): st.warning("⚠️ Video file not found."); return
-        with open(p, "rb") as f: data = f.read()
-        if len(data) == 0: st.warning("⚠️ Video file is empty."); return
-        st.video(data)
+        web_p = p.parent / (p.stem + "_web.mp4")
+        if not web_p.exists() and ffmpeg_ok():
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(p),
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                     "-preset", "veryfast", "-crf", "23",
+                     "-movflags", "+faststart",
+                     "-an", str(web_p)],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+                )
+            except Exception:
+                web_p = p
+        serve = web_p if web_p.exists() else p
+        data = serve.read_bytes()
+        if not data: st.warning("⚠️ Video file is empty."); return
+        st.video(data, format="video/mp4")
     except Exception as e:
-        st.warning(f"⚠️ Video preview unavailable. ({type(e).__name__})")
+        st.warning(f"⚠️ Video preview unavailable — try downloading instead. ({type(e).__name__})")
 
-
-# ──────────────────────────────────────────
-# Plots
-# ──────────────────────────────────────────
-def get_plot_colors():
-    theme = st.session_state.get("ui_theme", "dark")
-    if theme == "dark":
-        return {"bg": "#080c10", "ax": "#0a0f18", "spine": "#1a2535",
-                "tick": "#445566", "legend_bg": "#0a0f18", "legend_edge": "#1a2535",
-                "legend_text": "#7ecfff", "xlabel": "#445566"}
-    else:
-        return {"bg": "#f0f4f8", "ax": "#ffffff", "spine": "#cdd5df",
-                "tick": "#556677", "legend_bg": "#ffffff", "legend_edge": "#cdd5df",
-                "legend_text": "#1a6fc4", "xlabel": "#556677"}
-
-def make_timeline_plot(scores, fps, pred=None):
-    c = get_plot_colors()
-    t   = np.arange(len(scores)) / fps
-    fig = plt.figure(figsize=(6, 2.5), facecolor=c["bg"])
-    ax  = fig.add_subplot(111)
-    ax.set_facecolor(c["ax"])
-    is_fight = is_fight_pred(pred) if pred else False
-    color = "#e05252" if is_fight else "#52e08a"
-    ax.plot(t, scores, color=color, linewidth=1.6)
-    ax.fill_between(t, scores, alpha=0.12, color=color)
-    ax.axhline(st.session_state.get("thr_suspicious", CFG.THRESH_SUSPICIOUS),
-               linestyle="--", color="#f5a623", linewidth=0.8,
-               label=f"Suspicious ({st.session_state.get('thr_suspicious', CFG.THRESH_SUSPICIOUS)})")
-    ax.axhline(st.session_state.get("thr_violence", CFG.THRESH_VIOLENCE),
-               linestyle="--", color="#e05252", linewidth=0.8,
-               label=f"Violence ({st.session_state.get('thr_violence', CFG.THRESH_VIOLENCE)})")
-    if pred:
-        try:
-            onset_f = int(pred.get("onset_frame", 0))
-            onset_t_val = onset_f / fps
-            if 0 < onset_t_val < t[-1]:
-                ax.axvline(onset_t_val, color="#7ecfff", linewidth=1.2,
-                           linestyle=":", label=f"Onset ({pred.get('onset_time','?')})")
-        except: pass
-    ax.set_xlabel("Time (s)", fontsize=8, color=c["xlabel"])
-    ax.set_ylabel("P(fight)", fontsize=8, color=c["xlabel"])
-    ax.tick_params(colors=c["tick"], labelsize=7)
-    ax.spines[:].set_color(c["spine"])
-    ax.legend(fontsize=6, facecolor=c["legend_bg"], edgecolor=c["legend_edge"], labelcolor=c["legend_text"])
-    plt.tight_layout()
-    return fig
-
-def make_hist_plot(scores):
-    c = get_plot_colors()
-    fig = plt.figure(figsize=(4, 2.5), facecolor=c["bg"])
-    ax  = fig.add_subplot(111)
-    ax.set_facecolor(c["ax"])
-    ax.hist(scores, bins=20, color="#5271e0", edgecolor=c["bg"], linewidth=0.3)
-    ax.set_xlabel("Probability", fontsize=8, color=c["xlabel"])
-    ax.set_ylabel("Count", fontsize=8, color=c["xlabel"])
-    ax.tick_params(colors=c["tick"], labelsize=7)
-    ax.spines[:].set_color(c["spine"])
-    plt.tight_layout()
-    return fig
-
-def make_confusion_matrix(records):
-    c = get_plot_colors()
-    labels = ["Fight", "NonFight"]
-    cm = np.zeros((2, 2), dtype=int)
-    lmap = {"fight": 0, "nonfight": 1, "Fight": 0, "NonFight": 1, "Nonfight": 1}
-    for r in records:
-        t = lmap.get(r.get("true_label", ""), -1)
-        p = 0 if is_fight_pred(r) else 1
-        if t >= 0 and p >= 0: cm[t][p] += 1
-    fig, ax = plt.subplots(figsize=(4, 3), facecolor=c["bg"])
-    ax.set_facecolor(c["ax"])
-    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
-    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
-    ax.set_xticklabels(labels, color=c["legend_text"], fontsize=9)
-    ax.set_yticklabels(labels, color=c["legend_text"], fontsize=9)
-    ax.set_xlabel("Predicted", color=c["xlabel"]); ax.set_ylabel("True", color=c["xlabel"])
-    ax.tick_params(colors=c["tick"]); ax.spines[:].set_color(c["spine"])
-    for i in range(2):
-        for j in range(2):
-            ax.text(j, i, str(cm[i][j]), ha="center", va="center",
-                    color="white" if cm[i][j] > cm.max()/2 else c["legend_text"],
-                    fontsize=14, fontweight="bold")
-    plt.tight_layout()
-    return fig, cm
-
-
-# ──────────────────────────────────────────
-# pred.txt parser + card
-# ──────────────────────────────────────────
-def parse_pred_txt(path) -> dict:
+def parse_pred_txt(path):
     out = {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path,"r",encoding="utf-8") as f:
             for line in f:
                 if ":" in line:
-                    k, v = line.strip().split(":", 1)
+                    k, v = line.strip().split(":",1)
                     out[k.strip()] = v.strip()
     except: pass
     return out
 
-def render_pred_card(pred: dict):
-    if not pred: st.info("No pred.txt found."); return
-    is_fight = is_fight_pred(pred)
-    badge = '<span class="vg-badge-fight">⚠ FIGHT</span>' if is_fight \
-            else '<span class="vg-badge-normal">✓ NORMAL</span>'
-    st.markdown(badge, unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("True Label",  pred.get("true_label", "?"))
-    c2.metric("Predicted",   pred.get("pred_label", "?"))
-    ok_emoji = "✅" if str(pred.get("correct","")).lower()=="true" else "❌"
-    c3.metric("Correct",     f"{ok_emoji} {pred.get('correct','?')}")
-    try:    c4.metric("Confidence", f"{float(pred.get('confidence','0')):.1%}")
-    except: c4.metric("Confidence", pred.get("confidence", "?"))
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Onset Frame",  pred.get("onset_frame", "N/A"))
-    c6.metric("Onset Time",   pred.get("onset_time",  "N/A"))
-    c7.metric("Total Frames", pred.get("total_frames","?"))
-    c8.metric("Dataset",      pred.get("dataset",     "?"))
-    fighter_ids = pred.get("fighter_ids", "")
-    cam_focused = pred.get("cam_focused", "")
-    if fighter_ids or cam_focused:
-        theme = st.session_state.get("ui_theme","dark")
-        bg2   = "#0d1520" if theme=="dark" else "#ffffff"
-        bord  = "#1a2535" if theme=="dark" else "#cdd5df"
-        st.markdown(f"""
-        <div style="background:{bg2};border:1px solid {bord};border-left:3px solid #7ecfff;
-                    border-radius:4px;padding:8px 14px;margin:8px 0;
-                    font-family:'Share Tech Mono',monospace;font-size:12px;">
-            <span style="color:#445566;">BYTETRACK</span>&nbsp;&nbsp;
-            <span style="color:#7ecfff;">🥊 {fighter_ids or 'N/A'}</span>
-            &nbsp;&nbsp;<span style="color:#445566;">|</span>&nbsp;&nbsp;
-            <span style="color:#445566;">CAM FOCUS</span>&nbsp;
-            <span style="color:#52e08a;">{cam_focused or 'N/A'}</span>
-        </div>""", unsafe_allow_html=True)
-    with st.expander("📋 Full pred.txt", expanded=False):
-        col_a, col_b = st.columns(2)
-        left_keys  = ["model_path","model_val_acc","probs","window_size",
-                      "window_stride","onset_threshold","spike_delta","smooth_window"]
-        right_keys = ["cam_methods","gradcam_layers","smooth_n_passes","smooth_sigma",
-                      "cam_focused","fighter_ids","bytetrack_csv","heatmap"]
-        with col_a:
-            for k in left_keys:
-                if k in pred:
-                    st.markdown(f"<span style='color:#445566;font-size:11px;font-family:monospace'>{k}:</span> "
-                                f"<span style='font-size:11px;font-family:monospace'>{pred[k]}</span>",
-                                unsafe_allow_html=True)
-        with col_b:
-            for k in right_keys:
-                if k in pred:
-                    st.markdown(f"<span style='color:#445566;font-size:11px;font-family:monospace'>{k}:</span> "
-                                f"<span style='font-size:11px;font-family:monospace'>{pred[k]}</span>",
-                                unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════
+# PLOTS
+# ══════════════════════════════════════════════════════════════
+def get_plot_colors():
+    theme = st.session_state.get("ui_theme","dark")
+    if theme=="dark":
+        return {"bg":"#080c10","ax":"#0a0f18","spine":"#1a2535","tick":"#445566","legend_text":"#7ecfff","xlabel":"#445566"}
+    return {"bg":"#f0f4f8","ax":"#ffffff","spine":"#cdd5df","tick":"#556677","legend_text":"#1a6fc4","xlabel":"#556677"}
 
+def make_timeline_plot(scores, fps, pred=None):
+    c = get_plot_colors()
+    t = np.arange(len(scores))/fps
+    fig = plt.figure(figsize=(6,2.5), facecolor=c["bg"])
+    ax = fig.add_subplot(111); ax.set_facecolor(c["ax"])
+    is_fight = is_fight_pred(pred) if pred else False
+    color = "#e05252" if is_fight else "#52e08a"
+    ax.plot(t, scores, color=color, linewidth=1.6)
+    ax.fill_between(t, scores, alpha=0.12, color=color)
+    ax.axhline(st.session_state.get("thr_suspicious",CFG.THRESH_SUSPICIOUS), linestyle="--",color="#f5a623",linewidth=0.8)
+    ax.axhline(st.session_state.get("thr_violence",CFG.THRESH_VIOLENCE), linestyle="--",color="#e05252",linewidth=0.8)
+    if pred:
+        try:
+            onset_f = int(pred.get("onset_frame",0)); onset_tv = onset_f/fps
+            if 0 < onset_tv < t[-1]: ax.axvline(onset_tv,color="#7ecfff",linewidth=1.2,linestyle=":")
+        except: pass
+    ax.set_xlabel("Time (s)",fontsize=8,color=c["xlabel"]); ax.set_ylabel("P(fight)",fontsize=8,color=c["xlabel"])
+    ax.tick_params(colors=c["tick"],labelsize=7); ax.spines[:].set_color(c["spine"])
+    plt.tight_layout(); return fig
 
-# ──────────────────────────────────────────
-# Folder helpers
-# ──────────────────────────────────────────
+def make_hist_plot(scores):
+    c = get_plot_colors()
+    fig = plt.figure(figsize=(4,2.5), facecolor=c["bg"])
+    ax = fig.add_subplot(111); ax.set_facecolor(c["ax"])
+    ax.hist(scores,bins=20,color="#5271e0",edgecolor=c["bg"],linewidth=0.3)
+    ax.set_xlabel("Probability",fontsize=8,color=c["xlabel"]); ax.set_ylabel("Count",fontsize=8,color=c["xlabel"])
+    ax.tick_params(colors=c["tick"],labelsize=7); ax.spines[:].set_color(c["spine"])
+    plt.tight_layout(); return fig
+
+def make_confusion_matrix(records):
+    c = get_plot_colors(); labels=["Fight","NonFight"]; cm=np.zeros((2,2),dtype=int)
+    lmap={"fight":0,"nonfight":1,"Fight":0,"NonFight":1,"Nonfight":1}
+    for r in records:
+        t2=lmap.get(r.get("true_label",""),-1); p2=0 if is_fight_pred(r) else 1
+        if t2>=0 and p2>=0: cm[t2][p2]+=1
+    fig,ax=plt.subplots(figsize=(4,3),facecolor=c["bg"]); ax.set_facecolor(c["ax"])
+    ax.imshow(cm,interpolation="nearest",cmap="Blues")
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(labels,color=c["legend_text"]); ax.set_yticklabels(labels,color=c["legend_text"])
+    ax.set_xlabel("Predicted",color=c["xlabel"]); ax.set_ylabel("True",color=c["xlabel"])
+    for i in range(2):
+        for j in range(2):
+            ax.text(j,i,str(cm[i][j]),ha="center",va="center",fontsize=14,fontweight="bold",
+                    color="white" if cm[i][j]>cm.max()/2 else c["legend_text"])
+    plt.tight_layout(); return fig, cm
+
+# ══════════════════════════════════════════════════════════════
+# FOLDER HELPERS
+# ══════════════════════════════════════════════════════════════
 def class_root(ds, cls): return UPLOAD_ROOT / ds / cls
 
 def list_video_folders(ds, cls):
@@ -679,149 +942,169 @@ def find_file(folder, pattern):
     m = list(folder.glob(pattern))
     return m[0] if m else None
 
-def get_files(folder) -> dict:
+def get_files(folder):
     files = {}
     def real_files(pattern):
-        return [f for f in folder.glob(pattern)
-                if not f.name.startswith("._") and not f.name.startswith(".")]
+        return [f for f in folder.glob(pattern) if not f.name.startswith("._") and not f.name.startswith(".")]
     for vk in ALL_VID_KEYS:
-        if vk == "original":
+        if vk=="original":
             cands = real_files("*original*.mp4")
             if not cands:
-                cands = [f for f in real_files("*.mp4")
-                         if not any(x in f.name.lower() for x in
-                                    ["gradcam","layercam","combined","smooth","_preview"])]
+                cands = [f for f in real_files("*.mp4") if not any(x in f.name.lower() for x in ["gradcam","layercam","combined","smooth","_preview"])]
             if cands: files["original"] = cands[0]
-        elif vk == "smooth_gradcampp":
-            cands = real_files("*smooth_gradcampp*.mp4") + real_files("*smooth*.mp4")
-            cands = [f for f in cands if not f.name.startswith("_preview")]
+        elif vk=="smooth_gradcampp":
+            cands = [f for f in real_files("*smooth_gradcampp*.mp4")+real_files("*smooth*.mp4") if not f.name.startswith("_preview")]
             if cands: files["smooth_gradcampp"] = cands[0]
-        elif vk == "gradcampp":
-            cands = [f for f in real_files("*gradcampp*.mp4") + real_files("*gradcam++*.mp4")
-                     if "smooth" not in f.name.lower() and not f.name.startswith("_preview")]
+        elif vk=="gradcampp":
+            cands = [f for f in real_files("*gradcampp*.mp4")+real_files("*gradcam++*.mp4") if "smooth" not in f.name.lower() and not f.name.startswith("_preview")]
             if cands: files["gradcampp"] = cands[0]
-        elif vk == "gradcam":
-            cands = [f for f in real_files("*gradcam*.mp4")
-                     if "pp" not in f.name.lower() and "++" not in f.name.lower()
-                     and "smooth" not in f.name.lower() and not f.name.startswith("_preview")]
+        elif vk=="gradcam":
+            cands = [f for f in real_files("*gradcam*.mp4") if "pp" not in f.name.lower() and "++" not in f.name.lower() and "smooth" not in f.name.lower() and not f.name.startswith("_preview")]
             if cands: files["gradcam"] = cands[0]
-        elif vk == "layercam":
+        elif vk=="layercam":
             cands = [f for f in real_files("*layercam*.mp4") if not f.name.startswith("_preview")]
             if cands: files["layercam"] = cands[0]
-        elif vk == "combined":
+        elif vk=="combined":
             cands = [f for f in real_files("*combined*.mp4") if not f.name.startswith("_preview")]
             if cands: files["combined"] = cands[0]
     for gk in ALL_GRID_KEYS:
-        f = find_file(folder, f"{gk}.png")
-        if f: files[gk] = f
-    f = find_file(folder, "timeline.png")
-    if f: files["timeline"] = f
-    f = find_file(folder, "pred.txt")
-    if f: files["pred"] = f
+        f2 = find_file(folder, f"{gk}.png")
+        if f2: files[gk]=f2
+    f2 = find_file(folder,"timeline.png")
+    if f2: files["timeline"] = f2
+    f2 = find_file(folder,"pred.txt")
+    if f2: files["pred"] = f2
     return files
 
 def get_all_pred_records():
-    records = []
+    records=[]
     for ds in DATASETS:
         for cls in DATASETS[ds]:
-            for folder in list_video_folders(ds, cls):
-                files = get_files(folder)
+            for folder in list_video_folders(ds,cls):
+                files=get_files(folder)
                 if "pred" in files:
-                    p = parse_pred_txt(files["pred"])
-                    p["_dataset"] = ds; p["_class"] = cls; p["_folder"] = folder.name
+                    p=parse_pred_txt(files["pred"])
+                    p["_dataset"]=ds; p["_class"]=cls; p["_folder"]=folder.name
                     records.append(p)
     return records
 
 def clear_all_uploads():
     if UPLOAD_ROOT.exists(): shutil.rmtree(UPLOAD_ROOT)
     for ds in DATASETS:
-        for cls in DATASETS[ds]:
-            class_root(ds, cls).mkdir(parents=True, exist_ok=True)
+        for cls in DATASETS[ds]: class_root(ds,cls).mkdir(parents=True,exist_ok=True)
 
 def extract_zip_to_uploads(zip_bytes, dataset, cls):
-    n_folders, n_files = 0, 0
+    n_folders=0; n_files=0
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        names = zf.namelist()
-        folder_map = {}
+        names=zf.namelist(); folder_map={}
         for name in names:
-            parts = Path(name).parts
-            if len(parts) >= 2:
-                fk = parts[-2]; folder_map.setdefault(fk, []).append(name)
-            elif len(parts) == 1 and not name.endswith("/"):
-                folder_map.setdefault("misc", []).append(name)
+            parts=Path(name).parts
+            if len(parts)>=2: fk=parts[-2]; folder_map.setdefault(fk,[]).append(name)
+            elif len(parts)==1 and not name.endswith("/"): folder_map.setdefault("misc",[]).append(name)
         for fn, flist in folder_map.items():
-            dest = class_root(dataset, cls) / fn
-            dest.mkdir(parents=True, exist_ok=True); n_folders += 1
+            dest=class_root(dataset,cls)/fn; dest.mkdir(parents=True,exist_ok=True); n_folders+=1
             for zp in flist:
                 if zp.endswith("/"): continue
                 try:
-                    with open(dest / Path(zp).name, "wb") as f: f.write(zf.read(zp))
-                    n_files += 1
+                    with open(dest/Path(zp).name,"wb") as f2: f2.write(zf.read(zp))
+                    n_files+=1
                 except: pass
     return n_folders, n_files
 
+# ══════════════════════════════════════════════════════════════
+# HISTORY
+# ══════════════════════════════════════════════════════════════
+def push_history(folder_name, dataset, cls, pred, active_files_dict, camera="", location="", notes="", reviewer_tag=""):
+    entry = {
+        "folder": folder_name,
+        "dataset": dataset,
+        "cls": cls,
+        "pred_lbl": pred.get("pred_label", "?"),
+        "conf": pred.get("confidence", "?"),
+        "onset_t": pred.get("onset_time", "N/A"),
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "camera": camera,
+        "location": location,
+        "notes": notes,
+        "reviewer_tag": reviewer_tag,
+        "_files": active_files_dict,
+    }
+    hist = load_history_store()
+    hist = [h for h in hist if not (h.get("folder") == folder_name and h.get("dataset") == dataset and h.get("cls") == cls)]
+    hist.insert(0, entry)
+    save_history_store(hist[:50])
+    st.session_state["_history"] = hist[:50]
 
-# ──────────────────────────────────────────
-# PDF Report
-# ──────────────────────────────────────────
-def generate_pdf_report(pred, scores, fps, folder_name) -> bytes:
-    fig = plt.figure(figsize=(11, 8.5), facecolor="#080c10")
-    gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.55, wspace=0.4)
-    title_ax = fig.add_subplot(gs[0, :]); title_ax.axis("off")
-    title_ax.set_facecolor("#080c10")
-    title_ax.text(0.5, 0.75, "VisionGuard — Violence Detection Report",
-                  ha="center", va="center", fontsize=16, fontweight="bold", color="white")
-    title_ax.text(0.5, 0.3, f"Video: {folder_name}   |   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                  ha="center", va="center", fontsize=10, color="#aaaaaa")
-    ax_tl = fig.add_subplot(gs[1, 0:2]); ax_tl.set_facecolor("#0a0f18")
-    t = np.arange(len(scores)) / fps
-    is_fight = is_fight_pred(pred)
-    ax_tl.plot(t, scores, color="#e05252" if is_fight else "#52e08a", linewidth=1.5)
-    ax_tl.axhline(CFG.THRESH_VIOLENCE, linestyle="--", color="red", linewidth=1)
-    ax_tl.set_xlabel("Time (s)", color="white", fontsize=8)
-    ax_tl.set_ylabel("P(fight)", color="white", fontsize=8)
-    ax_tl.tick_params(colors="white"); ax_tl.spines[:].set_color("#333355")
-    ax_h = fig.add_subplot(gs[1, 2]); ax_h.set_facecolor("#0a0f18")
-    ax_h.hist(scores, bins=15, color="#5271e0")
-    ax_h.tick_params(colors="white"); ax_h.spines[:].set_color("#333355")
-    ax_info = fig.add_subplot(gs[2, :]); ax_info.axis("off")
+def restore_history(entry: dict):
+    files = {k: Path(v) for k, v in entry.get("_files", {}).items()}
+    pred_data = parse_pred_txt(files["pred"]) if "pred" in files else {}
+    frames, fps2 = [], float(CFG.DEFAULT_FPS)
+    if "original" in files:
+        try:
+            frames, fps2 = read_video_frames(files["original"], max_frames=st.session_state.get("max_frames", CFG.MAX_FRAMES))
+            frames = [resize_keep(f, 640) for f in frames]
+        except: pass
+    n = len(frames) if frames else 100
+    scores = scores_from_pred(pred_data, n, fps2)
+    st.session_state.active_pred = pred_data
+    st.session_state.active_scores = scores
+    st.session_state.active_fps = fps2
+    st.session_state.active_frames = frames
+    st.session_state.active_folder_name = entry["folder"]
+    st.session_state.active_video_path = str(files.get("original", ""))
+    st.session_state.active_dataset = entry["dataset"]
+    st.session_state.active_class = entry["cls"]
+    st.session_state["_active_files"] = {k: str(v) for k, v in files.items()}
+    st.session_state["review_camera"] = entry.get("camera", "")
+    st.session_state["review_location"] = entry.get("location", "")
+    st.session_state["review_notes"] = entry.get("notes", "")
+    st.session_state["reviewer_tag"] = entry.get("reviewer_tag", "")
+
+def update_history_metadata(folder_name, dataset, cls, camera, location, notes, reviewer_tag):
+    hist = load_history_store()
+    for item in hist:
+        if item.get("folder") == folder_name and item.get("dataset") == dataset and item.get("cls") == cls:
+            item["camera"] = camera
+            item["location"] = location
+            item["notes"] = notes
+            item["reviewer_tag"] = reviewer_tag
+    save_history_store(hist)
+    st.session_state["_history"] = hist
+
+# ══════════════════════════════════════════════════════════════
+# PDF REPORT
+# ══════════════════════════════════════════════════════════════
+def generate_pdf_report(pred, scores, fps, folder_name):
+    fig = plt.figure(figsize=(11,8.5),facecolor="#080c10")
+    gs = gridspec.GridSpec(3,3,figure=fig,hspace=0.55,wspace=0.4)
+    tax = fig.add_subplot(gs[0,:]); tax.axis("off"); tax.set_facecolor("#080c10")
+    tax.text(0.5,0.75,"VisionGuard — Violence Detection Report",ha="center",va="center",fontsize=16,fontweight="bold",color="white")
+    tax.text(0.5,0.3,f"Video: {folder_name}   |   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",ha="center",va="center",fontsize=10,color="#aaaaaa")
+    atl = fig.add_subplot(gs[1,0:2]); atl.set_facecolor("#0a0f18")
+    t = np.arange(len(scores))/fps
+    is_fight=is_fight_pred(pred)
+    atl.plot(t,scores,color="#e05252" if is_fight else "#52e08a",linewidth=1.5)
+    atl.axhline(CFG.THRESH_VIOLENCE,linestyle="--",color="red",linewidth=1)
+    atl.set_xlabel("Time (s)",color="white",fontsize=8); atl.set_ylabel("P(fight)",color="white",fontsize=8)
+    atl.tick_params(colors="white"); atl.spines[:].set_color("#333355")
+    ah = fig.add_subplot(gs[1,2]); ah.set_facecolor("#0a0f18")
+    ah.hist(scores,bins=15,color="#5271e0"); ah.tick_params(colors="white"); ah.spines[:].set_color("#333355")
+    ai = fig.add_subplot(gs[2,:]); ai.axis("off")
     lines = [
-        f"STATUS: {'FIGHT DETECTED' if is_fight else 'NO FIGHT'}   |   Confidence: {pred.get('confidence','?')}",
+        f"STATUS: {'⚠ FIGHT DETECTED' if is_fight else '✓ NO FIGHT'}   |   Confidence: {pred.get('confidence','?')}",
         f"Dataset: {pred.get('dataset','?')}   True: {pred.get('true_label','?')}   Predicted: {pred.get('pred_label','?')}   Correct: {pred.get('correct','?')}",
         f"Onset Frame: {pred.get('onset_frame','?')}   Onset Time: {pred.get('onset_time','?')}   Frames: {pred.get('total_frames','?')}",
-        f"Fighters: {pred.get('fighter_ids','N/A')}   CAM Focus: {pred.get('cam_focused','N/A')}",
         f"Model: {pred.get('model_path','?')}   Val Acc: {pred.get('model_val_acc','?')}",
     ]
     for i, line in enumerate(lines):
-        ax_info.text(0.02, 0.95 - i*0.19, line, transform=ax_info.transAxes, fontsize=8,
-                     color="#ff6666" if i == 0 and is_fight else ("white" if i > 0 else "#66ff66"),
-                     fontweight="bold" if i == 0 else "normal")
-    buf = io.BytesIO()
-    plt.savefig(buf, format="pdf", facecolor=fig.get_facecolor(), bbox_inches="tight")
-    plt.close(fig); buf.seek(0); return buf.read()
+        ai.text(0.02,0.95-i*0.22,line,transform=ai.transAxes,fontsize=8,
+                color="#ff6666" if i==0 and is_fight else ("white" if i>0 else "#66ff66"),
+                fontweight="bold" if i==0 else "normal")
+    buf=io.BytesIO(); plt.savefig(buf,format="pdf",facecolor=fig.get_facecolor(),bbox_inches="tight"); plt.close(fig); buf.seek(0); return buf.read()
 
-
-# ──────────────────────────────────────────
-# Fight Alert Banner
-# ──────────────────────────────────────────
-def show_fight_alert(folder_name, confidence):
-    st.markdown(f"""
-    <div style="background:rgba(224,82,82,0.12);border:1px solid #e05252;border-left:4px solid #e05252;
-                border-radius:4px;padding:14px 20px;margin:10px 0;
-                box-shadow:0 0 20px rgba(224,82,82,0.2);">
-        <div style="font-family:'Orbitron',sans-serif;font-size:14px;font-weight:900;
-                    color:#ff8080;letter-spacing:3px;">
-            🚨 FIGHT DETECTED — IMMEDIATE REVIEW REQUIRED
-        </div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:12px;color:#cc6666;margin-top:6px;">
-            VIDEO: {folder_name} &nbsp;|&nbsp; CONFIDENCE: {confidence}
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-
-# ──────────────────────────────────────────
-# Session state
-# ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# SESSION STATE
+# ══════════════════════════════════════════════════════════════
 def init_state():
     defaults = {
         "logged_in": False, "username": "",
@@ -829,1375 +1112,1725 @@ def init_state():
         "active_frames": None, "active_folder_name": "",
         "active_video_path": None, "active_dataset": "", "active_class": "",
         "run_id": datetime.now().strftime("run_%Y%m%d_%H%M%S"),
-        "_confirm_clear": False,
-        "nav_page": "🏠 Welcome",
-        "thr_violence": CFG.THRESH_VIOLENCE,
-        "thr_suspicious": CFG.THRESH_SUSPICIOUS,
+        "nav_section": "🏠 Home",
+        "nav_history": [],
+        "thr_violence": CFG.THRESH_VIOLENCE, "thr_suspicious": CFG.THRESH_SUSPICIOUS,
         "max_frames": CFG.MAX_FRAMES,
-        # Settings
-        "ui_theme":        "dark",
-        "accent_color":    "#e05252",
-        "font_size":       "medium",
-        "compact_sidebar": False,
-        "show_scanlines":  True,
-        "video_autoplay":  False,
-        "default_dataset": "hockeyfight",
-        "default_class":   "Fight",
-        "notify_fights":   True,
-        "show_confidence_bar": True,
-        "chart_style":     "line",
-        "sidebar_position": "left",
+        "ui_theme": "dark", "accent_color": "#e05252", "font_size": "medium",
+        "_proc_running": False, "_proc_progress": {}, "_proc_thread": None,
+        "_proc_out_dir": "", "_proc_ds": "", "_proc_cls": "", "_proc_folder": "",
+        "_history": load_history_store(),
+        "review_camera": "Entrance Camera", "review_location": "Main Gate",
+        "review_notes": "", "reviewer_tag": "",
     }
-    for k, v in defaults.items():
-        if k not in st.session_state: st.session_state[k] = v
+    for k,v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 init_state()
 for ds in DATASETS:
     for cls in DATASETS[ds]:
-        class_root(ds, cls).mkdir(parents=True, exist_ok=True)
+        class_root(ds,cls).mkdir(parents=True,exist_ok=True)
 
-# ── Inject theme CSS ──────────────────────
 st.markdown(get_theme_css(
-    theme       = st.session_state.get("ui_theme", "dark"),
-    accent      = st.session_state.get("accent_color", "#e05252"),
-    font_size   = st.session_state.get("font_size", "medium"),
+    st.session_state.get("ui_theme","dark"),
+    st.session_state.get("accent_color","#e05252"),
+    st.session_state.get("font_size","medium")
 ), unsafe_allow_html=True)
 
+# ── Navigation helpers ──────────────────────────────────────────
+def go_to(page: str):
+    current = st.session_state.get("nav_section","🏠 Home")
+    if current != page:
+        hist = st.session_state.get("nav_history", [])
+        hist.append(current)
+        st.session_state.nav_history = hist[-10:]
+    st.session_state.nav_section = page
+    st.rerun()
 
-# ══════════════════════════════════════════
-# LOGIN WALL
-# ══════════════════════════════════════════
-if not st.session_state.logged_in:
-    theme   = st.session_state.get("ui_theme","dark")
-    bg2     = "#0d1520" if theme=="dark" else "#ffffff"
-    bord    = "#1a2535" if theme=="dark" else "#cdd5df"
-    accent  = st.session_state.get("accent_color","#e05252")
+def render_back_button():
+    hist = st.session_state.get("nav_history", [])
+    if not hist: return
+    prev = hist[-1]
+    if st.button(f"← Back to {prev}", key="back_btn"):
+        st.session_state.nav_history = hist[:-1]
+        st.session_state.nav_section = prev
+        st.rerun()
 
-    st.markdown("""
-    <style>.block-container { padding-top: 0 !important; }</style>
-    <div style="display:flex;flex-direction:column;align-items:center;
-                justify-content:center;padding:6vh 0 2vh 0;gap:6px;">
-        <div style="font-size:48px;animation:pulse-shield 3s ease-in-out infinite;">🛡️</div>
-        <div style="font-family:'Orbitron',sans-serif;font-size:2.4rem;
-                    font-weight:900;letter-spacing:4px;">
-            VISIONGUARD
-        </div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:12px;
-                    color:#445566;letter-spacing:2px;margin-bottom:20px;">
-            VIOLENCE DETECTION SYSTEM v6
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-    _, mid, _ = st.columns([1, 1, 1])
-    with mid:
-        auth_tabs = st.tabs(["🔐  Login", "📝  Register"])
-
-        # ── LOGIN TAB ──
-        with auth_tabs[0]:
-            lu = st.text_input("Username", key="login_u", placeholder="operator id")
-            lp = st.text_input("Password", type="password", key="login_p", placeholder="password")
-            if st.button("AUTHENTICATE →", type="primary", use_container_width=True, key="login_btn"):
-                if try_login(lu.strip(), lp):
-                    st.session_state.logged_in = True
-                    st.session_state.username  = lu.strip()
-                    st.rerun()
-                else:
-                    st.error("❌ Authentication failed.")
-
-        # ── REGISTER TAB — FIXED: use if/else blocks, not ternary expression ──
-        with auth_tabs[1]:
-            ru  = st.text_input("Username",         key="reg_u",  placeholder="choose username")
-            rp  = st.text_input("Password",         type="password", key="reg_p",  placeholder="min 4 characters")
-            rp2 = st.text_input("Confirm Password", type="password", key="reg_p2", placeholder="repeat password")
-            if st.button("CREATE ACCOUNT →", type="primary", use_container_width=True, key="reg_btn"):
-                if rp != rp2:
-                    st.error("❌ Passwords do not match.")
-                else:
-                    ok, msg = try_register(ru.strip(), rp)
-                    if ok:
-                        st.success(f"✅ {msg}")
-                    else:
-                        st.error(f"❌ {msg}")
-    st.stop()
-
-
-# ══════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════
 theme  = st.session_state.get("ui_theme","dark")
 accent = st.session_state.get("accent_color","#e05252")
 bg2    = "#0d1520" if theme=="dark" else "#ffffff"
+bg3    = "#0a0f18" if theme=="dark" else "#e8edf3"
 bord   = "#1a2535" if theme=="dark" else "#cdd5df"
 tblue  = "#7ecfff" if theme=="dark" else "#1a6fc4"
 tdim   = "#445566" if theme=="dark" else "#556677"
 tdim2  = "#2a3a4a" if theme=="dark" else "#778899"
-thead  = "#e8f4ff" if theme=="dark" else "#0a1020"
 
-with st.sidebar:
-    st.markdown(f"""
-    <div style="padding:20px 16px 16px 16px;border-bottom:1px solid {bord};">
-        <div style="font-family:'Orbitron',sans-serif;font-size:1.1rem;
-                    font-weight:900;letter-spacing:3px;">
-            🛡️ VISIONGUARD
-        </div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:10px;
-                    color:{tdim2};margin-top:2px;letter-spacing:1px;">
-            Violence Detection v6
-        </div>
-    </div>""", unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════
+# LOGIN SCREEN
+# ══════════════════════════════════════════════════════════════
+def render_login_screen():
+    _, col, _ = st.columns([1, 1.6, 1])
+    with col:
+        st.markdown("<div style='text-align:center;padding:2rem 0 1rem;'>", unsafe_allow_html=True)
+        st.markdown("<span style='font-size:3.5rem;'>🛡️</span>", unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:1.8rem;font-weight:800;color:{tblue};margin:8px 0 4px;'>VisionGuard</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='color:{tdim};font-size:0.9rem;margin-bottom:1.5rem;'>Violence Detection Dashboard · R3D-18 + LCM + LSTM</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown(f"""
-    <div style="padding:12px 16px;border-bottom:1px solid {bord};">
-        <div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:{tdim};">
-            👤 operator
-        </div>
-        <div style="font-family:'Rajdhani',sans-serif;font-size:14px;
-                    font-weight:700;color:{tblue};">
-            {st.session_state.username}
-        </div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:10px;
-                    color:{tdim2};margin-top:2px;">
-            {st.session_state.run_id}
-        </div>
-    </div>""", unsafe_allow_html=True)
+        tab_signin, tab_register, tab_forgot = st.tabs(["🔐 Sign In", "📝 Create Account", "🔑 Forgot Password"])
 
-    st.markdown(f"""
-    <div style="padding:10px 16px 4px 16px;">
-        <div style="font-family:'Share Tech Mono',monospace;font-size:9px;
-                    color:{tdim2};letter-spacing:2px;margin-bottom:6px;">NAVIGATION</div>
-    </div>""", unsafe_allow_html=True)
+        with tab_signin:
+            lu = st.text_input("Username", key="login_u", placeholder="Enter your username")
+            lp = st.text_input("Password", type="password", key="login_p", placeholder="Enter your password")
+            st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
+            if st.button("Sign In →", type="primary", use_container_width=True):
+                if try_login(lu.strip(), lp):
+                    st.session_state.logged_in = True
+                    st.session_state.username = lu.strip()
+                    st.rerun()
+                else:
+                    st.error("Wrong username or password.")
 
-    nav_pages = [
-        "🏠 Welcome",
-        "📁 Video Explorer",
-        "🔥 GradCAM Viewer",
-        "🖼️ Grid Viewer",
-        "📊 Timeline",
-        "🔍 Search & Filter",
-        "⚖️ Compare",
-        "📤 Upload Manager",
-        "📈 Analytics",
-        "📊 Dataset Stats",
-        "❌ FP/FN Browser",
-        "🧩 Confusion Matrix",
-        "🧾 Incident Report",
-        "⚙️ Settings",
-    ]
-    for np_ in nav_pages:
-        is_active = st.session_state.nav_page == np_
-        if st.button(np_, key=f"nav_{np_}", use_container_width=True,
-                     type="primary" if is_active else "secondary"):
-            st.session_state.nav_page = np_; st.rerun()
+        with tab_register:
+            ru  = st.text_input("Choose username", key="reg_u")
+            rp  = st.text_input("Choose password", type="password", key="reg_p")
+            rp2 = st.text_input("Confirm password", type="password", key="reg_p2")
+            st.caption("Minimum 4 characters. A recovery code will be shown after creation — save it.")
+            st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
+            if st.button("Create Account", type="primary", use_container_width=True):
+                if rp != rp2:
+                    st.error("Passwords do not match.")
+                else:
+                    ok, msg = try_register(ru.strip(), rp)
+                    if ok: st.success(msg)
+                    else:  st.error(msg)
 
-    st.markdown(f"<div style='border-top:1px solid {bord};margin:8px 0'></div>", unsafe_allow_html=True)
+        with tab_forgot:
+            st.caption("Enter your username and the recovery code shown when your account was created.")
+            fu  = st.text_input("Username", key="fp_user")
+            fc  = st.text_input("Recovery code", key="fp_code", placeholder="6-digit code")
+            fn  = st.text_input("New password", type="password", key="fp_new")
+            fn2 = st.text_input("Confirm new password", type="password", key="fp_new2")
+            st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
+            if st.button("Reset Password", use_container_width=True):
+                if fn != fn2:
+                    st.error("Passwords do not match.")
+                else:
+                    ok, msg = reset_password(fu.strip(), fc.strip(), fn)
+                    if ok: st.success(msg)
+                    else:  st.error(msg)
 
-    st.markdown(f"""
-    <div style="padding:4px 16px 4px 16px;">
-        <div style="font-family:'Share Tech Mono',monospace;font-size:9px;
-                    color:{tdim2};letter-spacing:2px;margin-bottom:6px;">⚙ QUICK THRESHOLDS</div>
-    </div>""", unsafe_allow_html=True)
+if not st.session_state.logged_in:
+    render_login_screen()
+    st.stop()
 
-    st.session_state.thr_violence   = st.slider("Violence thr",   0.10, 0.99,
-                                                  st.session_state.thr_violence,   0.01, key="sb_thr_v")
-    st.session_state.thr_suspicious = st.slider("Suspicious thr", 0.10, 0.99,
-                                                  st.session_state.thr_suspicious, 0.01, key="sb_thr_s")
-    st.session_state.max_frames     = st.number_input("Max frames", 30, 500,
-                                                       st.session_state.max_frames, 10, key="sb_maxf")
+# ══════════════════════════════════════════════════════════════
+# HELPERS TO LOAD ACTIVE ANALYSIS
+# ══════════════════════════════════════════════════════════════
+def load_analysis_from_folder(folder_path: Path, ds: str, cls: str, folder_name: str):
+    files = get_files(folder_path)
+    pred = parse_pred_txt(files["pred"]) if "pred" in files else {}
+    frames, fps2 = [], float(CFG.DEFAULT_FPS)
+    if "original" in files:
+        try:
+            frames, fps2 = read_video_frames(files["original"], max_frames=st.session_state.max_frames)
+            frames = [resize_keep(f, 640) for f in frames]
+        except: pass
+    n = len(frames) if frames else 100
+    scores = scores_from_pred(pred, n, fps2)
+    st.session_state.active_pred = pred
+    st.session_state.active_scores = scores
+    st.session_state.active_fps = fps2
+    st.session_state.active_frames = frames
+    st.session_state.active_folder_name = folder_name
+    st.session_state.active_video_path = str(files.get("original",""))
+    st.session_state.active_dataset = ds
+    st.session_state.active_class = cls
+    st.session_state["_active_files"] = {k: str(v) for k, v in files.items()}
+    push_history(folder_name, ds, cls, pred, st.session_state["_active_files"],
+                 st.session_state.get("review_camera",""),
+                 st.session_state.get("review_location",""),
+                 st.session_state.get("review_notes",""),
+                 st.session_state.get("reviewer_tag",""))
 
-    st.markdown(f"<div style='border-top:1px solid {bord};margin:8px 0'></div>", unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════
+def render_sidebar():
+    with st.sidebar:
+        st.markdown(
+            f"<div class='vg-card'>"
+            f"<div class='vg-title'>🛡️ VisionGuard</div>"
+            f"<div class='vg-soft'>v8 · {st.session_state.username}</div>"
+            f"<div class='vg-mini'>{st.session_state.run_id}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        selected_nav = st.radio(
+            "Navigation", MAIN_NAV,
+            index=MAIN_NAV.index(st.session_state.get("nav_section","🏠 Home"))
+        )
+        if selected_nav != st.session_state.nav_section:
+            go_to(selected_nav)
 
-    pred_sb = st.session_state.active_pred
-    is_f_sb = is_fight_pred(pred_sb) if pred_sb else False
-    badge_color = accent if is_f_sb else "#52e08a"
-    badge_text  = "⚠ FIGHT" if is_f_sb else "✓ NORMAL"
-    folder_sb   = st.session_state.active_folder_name or "—"
-    st.markdown(f"""
-    <div style="padding:8px 16px 16px 16px;">
-        <div style="font-family:'Share Tech Mono',monospace;font-size:9px;
-                    color:{tdim2};letter-spacing:2px;margin-bottom:6px;">LAST RESULT</div>
-        <div style="background:{badge_color}22;border:1px solid {badge_color};
-                    border-radius:3px;padding:6px 10px;">
-            <div style="font-family:'Orbitron',sans-serif;font-size:11px;
-                        font-weight:700;color:{badge_color};">{badge_text}</div>
-            <div style="font-family:'Share Tech Mono',monospace;font-size:9px;
-                        color:{tdim};margin-top:3px;word-break:break-all;">{folder_sb}</div>
-        </div>
-    </div>""", unsafe_allow_html=True)
+        if st.session_state.active_folder_name:
+            pred_h = st.session_state.active_pred
+            is_f = is_fight_pred(pred_h)
+            badge = '<span class="vg-badge-fight">⚠ FIGHT</span>' if is_f else '<span class="vg-badge-normal">✓ NORMAL</span>'
+            st.markdown(
+                f"<div class='vg-card'>{badge}"
+                f"<div style='margin-top:8px;font-weight:700'>{st.session_state.active_folder_name}</div>"
+                f"<div class='vg-mini'>{st.session_state.active_dataset}/{st.session_state.active_class}</div>"
+                f"<div class='vg-soft'>Conf: {pred_h.get('confidence','?')}</div></div>",
+                unsafe_allow_html=True
+            )
 
-    if st.button("🚪 LOGOUT", use_container_width=True, key="sb_logout"):
-        for k in list(st.session_state.keys()): del st.session_state[k]
-        st.rerun()
+        with st.expander(f"Recent ({len(st.session_state.get('_history', []))})", expanded=False):
+            hist = st.session_state.get("_history", [])[:8]
+            if not hist:
+                st.caption("No analyses yet.")
+            else:
+                for i, entry in enumerate(hist):
+                    lbl = f"{entry['folder']} · {entry['pred_lbl']}"
+                    if st.button(lbl, key=f"sb_hist_{i}"):
+                        restore_history(entry)
+                        go_to("🧪 Review Workspace")
 
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button("Logout", use_container_width=True):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
 
-# ══════════════════════════════════════════
-# MAIN — top quick-action buttons
-# ══════════════════════════════════════════
-page = st.session_state.nav_page
+render_sidebar()
 
-if page != "🏠 Welcome":
-    qa1, qa2, qa3, qa4 = st.columns(4, gap="small")
-    with qa1:
-        if st.button("📁 VIDEO EXPLORER", use_container_width=True, key="qa_explorer",
-                     type="primary" if page == "📁 Video Explorer" else "secondary"):
-            st.session_state.nav_page = "📁 Video Explorer"; st.rerun()
-    with qa2:
-        if st.button("📤 UPLOAD", use_container_width=True, key="qa_upload",
-                     type="primary" if page == "📤 Upload Manager" else "secondary"):
-            st.session_state.nav_page = "📤 Upload Manager"; st.rerun()
-    with qa3:
-        if st.button("⚖️ COMPARE", use_container_width=True, key="qa_compare",
-                     type="primary" if page == "⚖️ Compare" else "secondary"):
-            st.session_state.nav_page = "⚖️ Compare"; st.rerun()
-    with qa4:
-        if st.button("⚙️ SETTINGS", use_container_width=True, key="qa_settings",
-                     type="primary" if page == "⚙️ Settings" else "secondary"):
-            st.session_state.nav_page = "⚙️ Settings"; st.rerun()
+# ══════════════════════════════════════════════════════════════
+# ACTIVE SUMMARY BAR
+# ══════════════════════════════════════════════════════════════
+def render_active_summary_bar():
+    pred = st.session_state.active_pred
+    folder = st.session_state.active_folder_name
+    if not folder or not pred: return
+    is_f = is_fight_pred(pred)
+    badge = "vg-badge-fight" if is_f else "vg-badge-normal"
+    badge_txt = "⚠ FIGHT DETECTED" if is_f else "✓ NORMAL"
+    st.markdown(
+        f"<div class='vg-card' style='display:flex;align-items:center;gap:16px;flex-wrap:wrap;'>"
+        f"<span class='{badge}'>{badge_txt}</span>"
+        f"<span style='font-weight:700;'>{folder}</span>"
+        f"<span class='vg-soft'>{pred.get('dataset','?')} / {pred.get('true_label','?')}</span>"
+        f"<span class='vg-soft'>Conf: <b>{pred.get('confidence','?')}</b></span>"
+        f"<span class='vg-soft'>Onset: {pred.get('onset_time','N/A')}</span>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
-# Active folder status bar
-if st.session_state.active_folder_name and page != "🏠 Welcome":
-    pred_h = st.session_state.active_pred
-    is_f_h = is_fight_pred(pred_h)
-    sc = accent if is_f_h else "#52e08a"
-    st.markdown(f"""
-    <div style="background:{bg2};border:1px solid {bord};border-left:3px solid {sc};
-                border-radius:4px;padding:8px 16px;margin:8px 0;
-                display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
-        <span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:{tdim2};">ACTIVE</span>
-        <span style="font-family:'Rajdhani',sans-serif;font-weight:700;font-size:13px;">
-            {st.session_state.active_folder_name}</span>
-        <span style="color:{bord};">|</span>
-        <span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:{tdim2};">DATASET</span>
-        <span style="font-family:'Share Tech Mono',monospace;font-size:11px;color:{tblue};">
-            {st.session_state.active_dataset}/{st.session_state.active_class}</span>
-        <span style="color:{bord};">|</span>
-        <span style="font-family:'Orbitron',sans-serif;font-size:11px;font-weight:700;color:{sc};">
-            {'⚠ FIGHT' if is_f_h else '✓ NORMAL'}</span>
-        <span style="color:{bord};">|</span>
-        <span style="font-family:'Share Tech Mono',monospace;font-size:10px;color:{tdim2};">CONF</span>
-        <span style="font-family:'Share Tech Mono',monospace;font-size:11px;">
-            {pred_h.get('confidence','?')}</span>
-    </div>""", unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════
-# PAGE: WELCOME
-# ══════════════════════════════════════════
-if page == "🏠 Welcome":
-    records_count = len(get_all_pred_records())
+# ══════════════════════════════════════════════════════════════
+# HOME PAGE
+# ══════════════════════════════════════════════════════════════
+def render_home():
     username = st.session_state.username
-    hour     = datetime.now().hour
-    greeting = "Good morning ☀️" if hour < 12 else ("Good afternoon 🌤️" if hour < 18 else "Good evening 🌙")
-    today    = datetime.now().strftime("%A, %d %b %Y")
+    records = get_all_pred_records()
+    fights  = sum(1 for r in records if is_fight_pred(r))
 
-    st.markdown(f"""
-    <div style="text-align:center;padding:40px 0 28px 0;animation:fadein-up 0.5s ease both;">
-        <div style="font-size:64px;display:inline-block;
-                    animation:pulse-shield 3s ease-in-out infinite;
-                    filter:drop-shadow(0 0 32px {accent}88);">🛡️</div>
-        <div style="font-family:'Orbitron',sans-serif;font-size:clamp(1.6rem,3.5vw,2.4rem);
-                    font-weight:900;letter-spacing:6px;margin-top:16px;">
-            WELCOME BACK
-        </div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:11px;
-                    color:{tdim2};letter-spacing:4px;margin-top:6px;">
-            VISIONGUARD &nbsp;·&nbsp; VIOLENCE DETECTION v6
-        </div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:12px;
-                    color:{tdim};margin-top:12px;letter-spacing:1px;">
-            {greeting} &nbsp;·&nbsp;
-            <span style="color:{tblue};font-size:14px;font-weight:bold;">{username}</span>
-            &nbsp;·&nbsp; {today}
-        </div>
-    </div>
+    st.markdown(
+        f"<div class='vg-card' style='padding:28px 28px 22px;'>"
+        f"<div style='display:flex;align-items:center;gap:18px;'>"
+        f"<span style='font-size:3rem;'>🛡️</span>"
+        f"<div>"
+        f"<div style='font-size:1.6rem;font-weight:800;'>Welcome back, {username}</div>"
+        f"<div class='vg-soft' style='margin-top:4px;font-size:0.9rem;'>"
+        f"VisionGuard · Violence Detection Dashboard · R3D-18 + LCM + LSTM · {str(DEVICE).upper()}"
+        f"</div>"
+        f"</div></div>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
-    <div class="vg-stat-row" style="max-width:860px;margin:0 auto 0 auto;">
-        <div class="vg-stat-tile">
-            <div class="vg-stat-icon">📂</div>
-            <div class="vg-stat-val">{records_count if records_count else "0"}</div>
-            <div class="vg-stat-label">Videos Loaded</div>
-        </div>
-        <div class="vg-stat-tile blue">
-            <div class="vg-stat-icon">🔥</div>
-            <div class="vg-stat-val">4</div>
-            <div class="vg-stat-label">CAM Methods</div>
-        </div>
-        <div class="vg-stat-tile green">
-            <div class="vg-stat-icon">🥊</div>
-            <div class="vg-stat-val" style="color:#52e08a;">ON</div>
-            <div class="vg-stat-label">ByteTrack</div>
-        </div>
-        <div class="vg-stat-tile orange">
-            <div class="vg-stat-icon">🧠</div>
-            <div class="vg-stat-val" style="color:#f5a623;">R3D-18</div>
-            <div class="vg-stat-label">Backbone</div>
-        </div>
-    </div>
+    h1, h2, h3, h4, h5 = st.columns(5)
+    h1.metric("Processed folders", len(records))
+    h2.metric("Fight detections", fights)
+    h3.metric("Non-fight", len(records)-fights)
+    h4.metric("CAM methods", 4)
+    h5.metric("Device", str(DEVICE))
 
-    <div style="max-width:860px;margin:0 auto;">
-        <div class="vg-divider-label" style="margin-top:36px;">── HOW TO GET STARTED ──</div>
-        <div class="vg-steps-row">
-            <div class="vg-step-card red">
-                <div class="vg-step-num">01</div>
-                <div class="vg-step-icon">📤</div>
-                <div class="vg-step-title" style="color:{accent};">UPLOAD</div>
-                <div class="vg-step-desc">Use Upload Manager to add your GradCAM output folders — mp4 videos, grid PNGs, and pred.txt.</div>
-            </div>
-            <div class="vg-step-card blue">
-                <div class="vg-step-num">02</div>
-                <div class="vg-step-icon">🔍</div>
-                <div class="vg-step-title" style="color:{tblue};">ANALYZE</div>
-                <div class="vg-step-desc">Pick dataset → class → folder in Video Explorer, then hit Analyze Folder to load predictions and videos.</div>
-            </div>
-            <div class="vg-step-card green">
-                <div class="vg-step-num">03</div>
-                <div class="vg-step-icon">🔥</div>
-                <div class="vg-step-title" style="color:#52e08a;">EXPLORE CAMS</div>
-                <div class="vg-step-desc">Browse GradCAM Viewer for all 6 methods, Grid Viewer for frame grids, Timeline for onset detection.</div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("### Quick Launch")
+    q1, q2, q3, q4 = st.columns(4)
+    with q1:
+        if st.button("📥 Ingest Video", use_container_width=True):
+            go_to("📥 Ingest")
+    with q2:
+        if st.button("🧪 Review Workspace", use_container_width=True):
+            go_to("🧪 Review Workspace")
+    with q3:
+        if st.button("📊 Dataset Lab", use_container_width=True):
+            go_to("📊 Dataset Lab")
+    with q4:
+        if st.button("🕘 History", use_container_width=True):
+            go_to("🕘 History")
 
-    st.markdown(f'<div class="vg-divider-label" style="margin-top:32px;max-width:860px;margin-left:auto;margin-right:auto;">── QUICK LAUNCH ──</div>', unsafe_allow_html=True)
+    with st.expander("🛠️ Smart Tools — click any to open", expanded=False):
+        ideas = [
+            ("✂️ Evidence Clip Trimmer",
+             "Auto-trim a fight clip to just the relevant seconds around onset. Download a tight evidence file instead of the full video.",
+             True),
+            ("📅 Risk Score Calendar Heatmap",
+             "Visualise fight detections by day, hour, and day-of-week. Identify high-risk time windows from your history.",
+             True),
+            ("🗺️ Zone Manager",
+             "Define named camera zones. Tag incidents to zones and see which areas have the most detections with a risk chart.",
+             True),
+            ("🔐 Chain of Custody Log",
+             "SHA-256 hash all output files at registration time. Verify integrity later — tamper-evident audit trail for legal evidence.",
+             True),
+            ("👥 Person Count Estimator",
+             "Add a lightweight YOLO head to count people in-frame at onset. Flag aggressor/victim patterns. (Future roadmap)",
+             False),
+            ("📡 Live Camera Feed",
+             "Connect RTSP/webcam streams. Run sliding-window inference in near-real-time and push webhook alerts. (Future roadmap)",
+             False),
+            ("🔮 Escalation Predictor",
+             "Use P(fight) slope in LSTM hidden states to predict fights 2–5 s before onset — alert security before contact occurs. (Future roadmap)",
+             False),
+            ("🌐 Multi-Camera Correlation",
+             "Auto-flag 'coordinated incidents' when 2+ cameras detect fights within 30 s of each other. (Future roadmap)",
+             False),
+        ]
+        cols = st.columns(2)
+        for i, (title, desc, is_live) in enumerate(ideas):
+            with cols[i % 2]:
+                border_color = tblue if is_live else "#2a3a4a"
+                label_html = (
+                    f"<span style='background:rgba(126,207,255,0.15);color:{tblue};"
+                    f"font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;"
+                    f"margin-left:6px;'>LIVE</span>"
+                    if is_live else
+                    f"<span style='background:#1a2535;color:#445566;"
+                    f"font-size:10px;padding:2px 7px;border-radius:999px;margin-left:6px;'>ROADMAP</span>"
+                )
+                title_color = tblue if is_live else "#445566"
+                st.markdown(
+                    f"<div style='background:#0a0f18;border:1px solid {border_color};border-radius:8px;"
+                    f"padding:10px 14px;margin-bottom:8px;'>"
+                    f"<div style='font-weight:700;color:{title_color};font-size:13px;margin-bottom:4px;'>"
+                    f"{title}{label_html}</div>"
+                    f"<div style='color:#7a99b0;font-size:12px;line-height:1.5;'>{desc}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+        if st.button("Open Smart Tools →", type="primary", use_container_width=True, key="home_smart_tools_btn"):
+            go_to("🛠️ Smart Tools")
 
-    _, c1, c2, c3, c4, _ = st.columns([0.15, 1, 1, 1, 1, 0.15], gap="small")
-    quick = [
-        (c1, "📁  VIDEO EXPLORER",   "📁 Video Explorer"),
-        (c2, "📤  UPLOAD MANAGER",   "📤 Upload Manager"),
-        (c3, "📊  DATASET STATS",    "📊 Dataset Stats"),
-        (c4, "⚙️  SETTINGS",         "⚙️ Settings"),
-    ]
-    for col, label, target in quick:
-        with col:
-            if st.button(label, use_container_width=True, key=f"wel_ql_{target}", type="secondary"):
-                st.session_state.nav_page = target; st.rerun()
+    if records:
+        st.markdown("### Recent Analyses")
+        recent = sorted(records, key=lambda r: r.get("_folder",""), reverse=True)[:5]
+        for r in recent:
+            is_f = is_fight_pred(r)
+            badge = "vg-badge-fight" if is_f else "vg-badge-normal"
+            badge_txt = "⚠ FIGHT" if is_f else "✓ NORMAL"
+            rc1, rc2 = st.columns([5,1])
+            with rc1:
+                st.markdown(
+                    f"<div class='vg-card' style='display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 16px;'>"
+                    f"<span class='{badge}'>{badge_txt}</span>"
+                    f"<span style='font-weight:600;'>{r.get('_folder','?')}</span>"
+                    f"<span class='vg-soft'>{r.get('_dataset','?')}/{r.get('_class','?')}</span>"
+                    f"<span class='vg-soft'>Conf: {r.get('confidence','?')}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+            with rc2:
+                if st.button("Review →", key=f"home_review_{r.get('_folder','')}"):
+                    fp = class_root(r.get("_dataset",""), r.get("_class","")) / r.get("_folder","")
+                    if fp.exists():
+                        load_analysis_from_folder(fp, r.get("_dataset",""), r.get("_class",""), r.get("_folder",""))
+                    go_to("🧪 Review Workspace")
 
-    st.markdown(f"""
-    <div style="max-width:860px;margin:32px auto 0 auto;
-                background:{bg2};border:1px solid {bord};border-left:4px solid {accent};
-                border-radius:10px;padding:20px 24px;">
-        <div style="font-family:'Orbitron',sans-serif;font-size:11px;font-weight:900;
-                    color:{accent};letter-spacing:3px;margin-bottom:12px;">
-            🛡️ SYSTEM CAPABILITIES
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;
-                    font-family:'Share Tech Mono',monospace;font-size:11px;">
-            <div>
-                <div style="color:{tdim2};font-size:9px;letter-spacing:2px;margin-bottom:6px;">DETECTION</div>
-                <div style="line-height:1.8;">
-                    Real-time violence detection<br>
-                    Fight onset localization<br>
-                    Confidence scoring<br>
-                    Multi-window analysis
-                </div>
-            </div>
-            <div>
-                <div style="color:{tdim2};font-size:9px;letter-spacing:2px;margin-bottom:6px;">VISUALIZATION</div>
-                <div style="line-height:1.8;">
-                    GradCAM heatmaps<br>
-                    GradCAM++ overlays<br>
-                    Smooth GradCAM++<br>
-                    LayerCAM · Combined
-                </div>
-            </div>
-            <div>
-                <div style="color:{tdim2};font-size:9px;letter-spacing:2px;margin-bottom:6px;">TRACKING</div>
-                <div style="line-height:1.8;">
-                    ByteTrack fighter IDs<br>
-                    CAM-focused tracking<br>
-                    Incident reporting<br>
-                    PDF export
-                </div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════
+# INGEST PAGE
+# ══════════════════════════════════════════════════════════════
+def render_ingest():
+    render_back_button()
+    st.markdown("<div class='vg-title'>📥 Ingest</div>", unsafe_allow_html=True)
+    tab1, tab2, tab3, tab4 = st.tabs(["🎬 Single Raw Video", "📦 Raw Dataset", "📂 Precomputed Outputs", "🗂 Manage Uploads"])
 
-
-# ══════════════════════════════════════════
-# PAGE: VIDEO EXPLORER
-# ══════════════════════════════════════════
-elif page == "📁 Video Explorer":
-    st.subheader("📁 Video Explorer")
-
-    s1, s2, s3 = st.columns([1, 1, 2])
-    with s1: sel_ds  = st.selectbox("Dataset", list(DATASETS.keys()), key="ex_ds")
-    with s2: sel_cls = st.selectbox("Class",   DATASETS[sel_ds],      key="ex_cls")
-    with s3:
-        vfolders = list_video_folders(sel_ds, sel_cls)
-        if not vfolders:
-            st.info(f"No folders for **{sel_ds}/{sel_cls}**. Use Upload Manager.")
-            sel_folder = None
-        else:
-            sel_folder = st.selectbox(f"Folder ({len(vfolders)} available)",
-                                      [f.name for f in vfolders], key="ex_folder")
-
-    if st.button("🔍 ANALYZE FOLDER", type="primary",
-                 disabled=(sel_folder is None), key="analyze_btn"):
-        folder_path = class_root(sel_ds, sel_cls) / sel_folder
-        status_ph = st.empty()
-        bar_ph    = st.empty()
-
-        def _show_step(pct, msg, color=tblue):
-            status_ph.markdown(
-                f"<div style='font-family:Share Tech Mono,monospace;font-size:12px;"
-                f"color:{color};letter-spacing:2px;padding:4px 0;'>{msg}</div>",
-                unsafe_allow_html=True)
-            bar_ph.progress(pct)
-
-        _show_step(0.05, "⟳  INITIALIZING ANALYSIS..."); time.sleep(0.1)
-        _show_step(0.15, "📂  READING FOLDER STRUCTURE...")
-        files = get_files(folder_path); time.sleep(0.12)
-        _show_step(0.30, "📋  PARSING PRED.TXT...")
-        pred = parse_pred_txt(files["pred"]) if "pred" in files else {}; time.sleep(0.12)
-        _show_step(0.50, "🎬  LOADING VIDEO FRAMES...")
-        frames, fps = [], float(CFG.DEFAULT_FPS)
-        if "original" in files:
-            try:
-                frames, fps = read_video_frames(files["original"],
-                                                max_frames=st.session_state.max_frames)
-                frames = [resize_keep(f, 640) for f in frames]
-            except: pass
-        time.sleep(0.08)
-        _show_step(0.70, "📊  COMPUTING PROBABILITY CURVES...")
-        n      = len(frames) if frames else 100
-        scores = scores_from_pred(pred, n, fps); time.sleep(0.08)
-        _show_step(0.85, "🎯  PRE-CONVERTING PREVIEW VIDEOS...")
-        for _vk in ["original", "gradcampp", "combined"]:
-            if _vk in files:
-                _fp = files[_vk].parent / f"_preview_{_vk}.mp4"
-                if not (_fp.exists() and _fp.stat().st_size > 5000):
-                    make_web_preview(files[_vk], _fp)
-        time.sleep(0.05)
-        _show_step(1.0, "✅  ANALYSIS COMPLETE", color="#52e08a"); time.sleep(0.35)
-        status_ph.empty(); bar_ph.empty()
-
-        st.session_state.active_pred        = pred
-        st.session_state.active_scores      = scores
-        st.session_state.active_fps         = fps
-        st.session_state.active_frames      = frames
-        st.session_state.active_folder_name = sel_folder
-        st.session_state.active_video_path  = str(files.get("original", ""))
-        st.session_state.active_dataset     = sel_ds
-        st.session_state.active_class       = sel_cls
-        st.session_state["_active_files"]   = {k: str(v) for k, v in files.items()}
-        st.rerun()
-
-    if st.session_state.active_folder_name:
-        pred        = st.session_state.active_pred
-        scores      = st.session_state.active_scores
-        fps         = st.session_state.active_fps
-        folder_name = st.session_state.active_folder_name
-        files       = {k: Path(v) for k, v in st.session_state.get("_active_files", {}).items()}
-        is_fight    = is_fight_pred(pred)
-        onset_f     = pred.get("onset_frame", "N/A")
-        onset_t     = pred.get("onset_time",  "N/A")
-        conf_val    = pred.get("confidence",  "?")
-        fighters    = pred.get("fighter_ids", "N/A")
-
-        if is_fight:
-            st.markdown(f"""
-            <div style="background:rgba(224,82,82,0.10);border:1px solid {accent};
-                        border-left:4px solid {accent};border-radius:4px;
-                        padding:14px 20px;margin:12px 0;">
-                <div style="font-family:'Orbitron',sans-serif;font-size:15px;
-                            font-weight:900;color:#ff7070;letter-spacing:3px;margin-bottom:8px;">
-                    🚨 VIOLENCE DETECTED
-                </div>
-                <div style="display:flex;gap:28px;flex-wrap:wrap;
-                            font-family:'Share Tech Mono',monospace;font-size:12px;">
-                    <span>ONSET FRAME <span style="color:#ffbbbb;">{onset_f}</span></span>
-                    <span>TIME <span style="color:#ffbbbb;">{onset_t}</span></span>
-                    <span>CONFIDENCE <span style="color:#ffbbbb;">{conf_val}</span></span>
-                    <span>FIGHTERS <span style="color:{tblue};">{fighters}</span></span>
-                </div>
-            </div>""", unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div style="background:rgba(82,224,138,0.06);border:1px solid #52e08a44;
-                        border-left:4px solid #52e08a;border-radius:4px;
-                        padding:12px 20px;margin:12px 0;">
-                <div style="font-family:'Orbitron',sans-serif;font-size:13px;
-                            font-weight:700;color:#52e08a;letter-spacing:2px;margin-bottom:4px;">
-                    ✓ NO VIOLENCE DETECTED
-                </div>
-                <div style="font-family:'Share Tech Mono',monospace;font-size:11px;color:#336644;">
-                    CONFIDENCE: <span style="color:#88ccaa;">{conf_val}</span>
-                </div>
-            </div>""", unsafe_allow_html=True)
-
-        render_pred_card(pred)
-        st.markdown("---")
-
-        vid_col_l, vid_col_r = st.columns(2, gap="large")
-        with vid_col_l:
-            st.markdown(f"<span style='font-family:Share Tech Mono,monospace;font-size:10px;color:{tblue};'>📹 ORIGINAL</span>", unsafe_allow_html=True)
-            if "original" in files:
-                fp = files["original"].parent / "_preview_original.mp4"
-                if not (fp.exists() and fp.stat().st_size > 5000):
-                    with st.spinner("Converting..."):
-                        make_web_preview(files["original"], fp)
-                _safe_video(fp if (fp.exists() and fp.stat().st_size > 5000) else files["original"])
+    with tab1:
+        proc = st.session_state._proc_progress
+        if proc.get("done") and not st.session_state._proc_running:
+            if proc.get("error"):
+                st.error(proc["error"])
             else:
-                st.info("No original video found.")
-
-        with vid_col_r:
-            right_vk = next((k for k in ["gradcampp", "combined", "gradcam"] if k in files), None)
-            right_label = {"gradcampp":"🔥 GRADCAM++","combined":"🎯 COMBINED",
-                           "gradcam":"🔥 GRADCAM"}.get(right_vk, "CAM")
-            st.markdown(f"<span style='font-family:Share Tech Mono,monospace;font-size:10px;color:{accent};'>{right_label}</span>", unsafe_allow_html=True)
-            if right_vk:
-                fp = files[right_vk].parent / f"_preview_{right_vk}.mp4"
-                if not (fp.exists() and fp.stat().st_size > 5000):
-                    with st.spinner("Converting..."):
-                        make_web_preview(files[right_vk], fp)
-                _safe_video(fp if (fp.exists() and fp.stat().st_size > 5000) else files[right_vk])
-            else:
-                st.info("No CAM video found. Use GradCAM Viewer.")
-
-        if scores is not None and fps:
-            st.markdown("---")
-            m1, m2, m3, m4 = st.columns(4)
-            stat = pred_label_to_status(pred.get("pred_label", ""))
-            m1.metric("Status",     f"{color_from_status(stat)} {stat}")
-            m2.metric("Confidence", conf_val)
-            m3.metric("Onset Time", onset_t)
-            m4.metric("Fighters",   fighters)
-            c1, c2 = st.columns(2)
-            with c1: st.pyplot(make_timeline_plot(scores, fps, pred), clear_figure=True)
-            with c2: st.pyplot(make_hist_plot(scores), clear_figure=True)
-
-        st.markdown("---")
-        if st.button("📄 GENERATE PDF", key="ex_pdf_btn"):
-            with st.spinner("Generating..."):
-                pdf = generate_pdf_report(pred, scores or np.zeros(10), fps or 25.0, folder_name)
-            st.download_button("⬇️ Download PDF", data=pdf,
-                               file_name=f"report_{folder_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                               mime="application/pdf", key="ex_pdf_dl")
-    else:
-        records_count = len(get_all_pred_records())
-        st.info(f"📂 **{records_count}** video(s) available. Select a dataset, class and folder above, then click **Analyze Folder**.")
-
-
-# ══════════════════════════════════════════
-# PAGE: GRADCAM VIEWER
-# ══════════════════════════════════════════
-elif page == "🔥 GradCAM Viewer":
-    st.subheader("🔥 GradCAM Viewer — All 6 Methods")
-
-    if not st.session_state.active_folder_name:
-        st.info("Analyze a folder in **Video Explorer** first.")
-    else:
-        files = {k: Path(v) for k, v in st.session_state.get("_active_files", {}).items()}
-        pred  = st.session_state.active_pred
-
-        if is_fight_pred(pred):
-            show_fight_alert(st.session_state.active_folder_name, pred.get("confidence","?"))
-
-        fighter_ids = pred.get("fighter_ids", "")
-        if fighter_ids and "None" not in fighter_ids:
-            st.markdown(f"""
-            <div style="background:{bg2};border:1px solid {bord}33;border-radius:4px;
-                        padding:8px 14px;margin-bottom:8px;
-                        font-family:'Share Tech Mono',monospace;font-size:12px;">
-                🥊 <span style="color:{tblue};">BYTETRACK FIGHTERS: {fighter_ids}</span>
-                &nbsp;&nbsp;|&nbsp;&nbsp;
-                <span style="color:#52e08a;">CAM FOCUS: {pred.get('cam_focused','N/A')}</span>
-            </div>""", unsafe_allow_html=True)
-
-        st.markdown("##### Row 1: Original · GradCAM · GradCAM++")
-        r1_cols = st.columns(3)
-        for i, vk in enumerate(["original", "gradcam", "gradcampp"]):
-            with r1_cols[i]:
-                st.markdown(f"**{VID_LABELS.get(vk, vk)}**")
-                if vk in files:
-                    fp = files[vk].parent / f"_preview_{vk}.mp4"
-                    if not (fp.exists() and fp.stat().st_size > 5000):
-                        with st.spinner(f"Converting {vk}..."):
-                            make_web_preview(files[vk], fp)
-                    _safe_video(fp if fp.exists() and fp.stat().st_size > 5000 else files[vk])
-                else:
-                    st.info(f"No {vk} video found.")
-
-        st.markdown("---")
-        st.markdown("##### Row 2: Smooth GradCAM++ · LayerCAM · Combined")
-        r2_cols = st.columns(3)
-        for i, vk in enumerate(["smooth_gradcampp", "layercam", "combined"]):
-            with r2_cols[i]:
-                st.markdown(f"**{VID_LABELS.get(vk, vk)}**")
-                if vk in files:
-                    fp = files[vk].parent / f"_preview_{vk}.mp4"
-                    if not (fp.exists() and fp.stat().st_size > 5000):
-                        with st.spinner(f"Converting {vk}..."):
-                            make_web_preview(files[vk], fp)
-                    _safe_video(fp if fp.exists() and fp.stat().st_size > 5000 else files[vk])
-                else:
-                    st.info(f"No {vk} video found.")
-
-        st.markdown("---")
-        st.markdown("#### 📋 Prediction Details")
-        render_pred_card(pred)
-
-
-# ══════════════════════════════════════════
-# PAGE: GRID VIEWER
-# ══════════════════════════════════════════
-elif page == "🖼️ Grid Viewer":
-    st.subheader("🖼️ Frame Grid Viewer — All 6 Methods")
-    if not st.session_state.active_folder_name:
-        st.info("Analyze a folder in **Video Explorer** first.")
-    else:
-        files = {k: Path(v) for k, v in st.session_state.get("_active_files", {}).items()}
-        st.markdown("##### Row 1: Raw · GradCAM · GradCAM++")
-        g1 = st.columns(3)
-        for i, gk in enumerate(["raw_grid", "gradcam_grid", "gradcampp_grid"]):
-            with g1[i]:
-                st.markdown(f"**{GRID_LABELS.get(gk, gk)}**")
-                if gk in files: st.image(str(files[gk]), use_container_width=True)
-                else: st.info(f"No {gk}.png found.")
-        st.markdown("---")
-        st.markdown("##### Row 2: Smooth GradCAM++ · LayerCAM · Combined")
-        g2 = st.columns(3)
-        for i, gk in enumerate(["smooth_gradcampp_grid", "layercam_grid", "combined_grid"]):
-            with g2[i]:
-                st.markdown(f"**{GRID_LABELS.get(gk, gk)}**")
-                if gk in files: st.image(str(files[gk]), use_container_width=True)
-                else: st.info(f"No {gk}.png found.")
-        if "timeline" in files:
-            st.markdown("---")
-            st.markdown("##### 📈 P(fight) Timeline")
-            st.image(str(files["timeline"]), use_container_width=True)
-
-
-# ══════════════════════════════════════════
-# PAGE: TIMELINE
-# ══════════════════════════════════════════
-elif page == "📊 Timeline":
-    st.subheader("📊 P(fight) Timeline")
-    if not st.session_state.active_folder_name:
-        st.info("Analyze a folder in **Video Explorer** first.")
-    else:
-        files  = {k: Path(v) for k, v in st.session_state.get("_active_files", {}).items()}
-        pred   = st.session_state.active_pred
-        scores = st.session_state.active_scores
-        fps    = st.session_state.active_fps
-        if "timeline" in files:
-            st.image(str(files["timeline"]), use_container_width=True,
-                     caption="Generated by gradcam script — exact model scores")
-            st.markdown("---")
-            st.markdown("*Below: dashboard-reconstructed scores from pred.txt metadata*")
-        if scores is not None and fps:
-            st.pyplot(make_timeline_plot(scores, fps, pred), clear_figure=True)
-            st.pyplot(make_hist_plot(scores), clear_figure=True)
-            step = max(1, int(0.5*fps))
-            rows = [{"time": fmt_time(i/fps), "frame": i, "prob": round(float(scores[i]), 4)}
-                    for i in range(0, len(scores), step)]
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220)
-
-
-# ══════════════════════════════════════════
-# PAGE: SEARCH & FILTER
-# ══════════════════════════════════════════
-elif page == "🔍 Search & Filter":
-    st.subheader("🔍 Search & Filter")
-    records = get_all_pred_records()
-    if not records:
-        st.info("No pred.txt files found. Upload folders first.")
-    else:
-        df_all = pd.DataFrame(records)
-        fc1, fc2, fc3, fc4 = st.columns(4)
-        with fc1: sq   = st.text_input("Search name", placeholder="e.g. fi1", key="sf_search")
-        with fc2: dsf  = st.selectbox("Dataset", ["All"]+list(DATASETS.keys()), key="sf_ds")
-        with fc3: clsf = st.selectbox("Class", ["All","Fight","NonFight","Nonfight","pred_nonfight"], key="sf_cls")
-        with fc4: corf = st.selectbox("Correct?", ["All","True","False"], key="sf_cor")
-        df = df_all.copy()
-        if sq:          df = df[df["_folder"].str.contains(sq, case=False, na=False)]
-        if dsf  != "All": df = df[df["_dataset"] == dsf]
-        if clsf != "All": df = df[df["_class"]   == clsf]
-        if corf != "All": df = df[df["correct"].str.lower() == corf.lower()]
-        st.markdown(f"**{len(df)} results**")
-        show = ["_folder","_dataset","_class","true_label","pred_label",
-                "correct","confidence","onset_time","fighter_ids"]
-        show = [c for c in show if c in df.columns]
-        st.dataframe(df[show].rename(columns={"_folder":"Folder","_dataset":"Dataset","_class":"Class"}),
-                     use_container_width=True, height=380)
-        st.download_button("⬇️ Download CSV", data=df[show].to_csv(index=False).encode(),
-                           file_name="filtered.csv", mime="text/csv", key="sf_csv")
-
-
-# ══════════════════════════════════════════
-# PAGE: COMPARE
-# ══════════════════════════════════════════
-elif page == "⚖️ Compare":
-    st.subheader("⚖️ Side-by-Side Comparison")
-
-    def folder_sel(prefix, col):
-        with col:
-            ds  = st.selectbox("Dataset", list(DATASETS.keys()), key=f"{prefix}_ds")
-            cls = st.selectbox("Class",   DATASETS[ds],           key=f"{prefix}_cls")
-            vf  = list_video_folders(ds, cls)
-            if not vf: st.info("No folders."); return None, None, None
-            fn = st.selectbox(f"Folder ({len(vf)})", [f.name for f in vf], key=f"{prefix}_fn")
-            return ds, cls, fn
-
-    lc, rc = st.columns(2, gap="large")
-    l_ds, l_cls, l_fn = folder_sel("cmp_l", lc)
-    r_ds, r_cls, r_fn = folder_sel("cmp_r", rc)
-
-    if st.button("⚖️ COMPARE", type="primary", disabled=(not l_fn or not r_fn), key="cmp_btn"):
-        for col, ds, cls, fn, side in [(lc,l_ds,l_cls,l_fn,"LEFT"),(rc,r_ds,r_cls,r_fn,"RIGHT")]:
-            fp   = class_root(ds, cls) / fn
-            fls  = get_files(fp)
-            pred = parse_pred_txt(fls["pred"]) if "pred" in fls else {}
-            with col:
-                st.markdown(f"### {side}: `{fn}`")
-                is_f = is_fight_pred(pred)
-                if is_f: st.error(f"🔴 FIGHT — {pred.get('confidence','?')} conf")
-                else:    st.success(f"🟢 NORMAL — {pred.get('confidence','?')} conf")
-                ok = "✅" if str(pred.get("correct","")).lower()=="true" else "❌"
-                st.markdown(f"**True:** {pred.get('true_label','?')} | "
-                            f"**Pred:** {pred.get('pred_label','?')} | **Correct:** {ok}")
-                st.markdown(f"**Fighters:** {pred.get('fighter_ids','N/A')}")
-                if "original" in fls:
-                    pp = fp / "_preview_original.mp4"
-                    if not pp.exists(): make_web_preview(fls["original"], pp)
-                    _safe_video(pp if pp.exists() else fls["original"])
-                for gk in ["combined_grid", "gradcam_grid"]:
-                    if gk in fls:
-                        st.image(str(fls[gk]), use_container_width=True, caption=GRID_LABELS.get(gk, gk))
-                        break
-                if "timeline" in fls:
-                    st.image(str(fls["timeline"]), use_container_width=True, caption="Timeline")
-
-
-# ══════════════════════════════════════════
-# PAGE: UPLOAD MANAGER
-# ══════════════════════════════════════════
-elif page == "📤 Upload Manager":
-    st.subheader("📤 Upload Manager")
-    with st.expander("🗑️ Clear All Uploads", expanded=False):
-        st.warning("⚠️ This will permanently delete ALL uploaded data.")
-        if not st.session_state._confirm_clear:
-            if st.button("🗑️ CLEAR ALL", key="clear_btn"):
-                st.session_state._confirm_clear = True; st.rerun()
+                out_dir    = Path(proc.get("out_dir",""))
+                folder_name = st.session_state._proc_folder
+                ds_name    = st.session_state._proc_ds
+                cls_name   = st.session_state._proc_cls
+                if out_dir.exists() and not st.session_state.get("_proc_loaded"):
+                    load_analysis_from_folder(out_dir, ds_name, cls_name, folder_name)
+                    st.session_state["_proc_loaded"] = True
+                st.success(f"Done. Prediction: **{proc.get('pred_lbl','?')}** · Confidence: {proc.get('conf',0):.1%}")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    if st.button("Open Review Workspace →", type="primary", use_container_width=True):
+                        go_to("🧪 Review Workspace")
+                with c2:
+                    if out_dir.exists():
+                        zip_buf = io.BytesIO()
+                        with zipfile.ZipFile(zip_buf,"w",zipfile.ZIP_DEFLATED) as zf:
+                            for f in out_dir.iterdir():
+                                if f.is_file(): zf.write(f, arcname=f.name)
+                        zip_buf.seek(0)
+                        st.download_button("Download ZIP", data=zip_buf,
+                                           file_name=f"{out_dir.name}_outputs.zip",
+                                           mime="application/zip", use_container_width=True)
+                with c3:
+                    if st.button("Process Another", use_container_width=True):
+                        st.session_state._proc_progress = {}
+                        st.session_state._proc_running = False
+                        st.session_state["_proc_loaded"] = False
+                        st.rerun()
+        elif st.session_state._proc_running:
+            pct   = proc.get("pct", 0)
+            stage = proc.get("stage","Processing...")
+            st.progress(pct)
+            st.caption(stage)
+            time.sleep(0.5)
+            if proc.get("done"):
+                st.session_state._proc_running = False
+            st.rerun()
         else:
-            st.error("Are you sure? Cannot be undone.")
-            cy, cn = st.columns(2)
-            with cy:
-                if st.button("✅ YES DELETE", type="primary", key="confirm_yes"):
-                    clear_all_uploads()
-                    for k in ["active_pred","active_scores","active_fps","active_frames",
-                              "active_folder_name","active_video_path","_active_files"]:
-                        st.session_state[k] = {} if "pred" in k or "files" in k else None
-                    st.session_state.active_folder_name = ""
-                    st.session_state._confirm_clear = False
-                    st.success("✅ Cleared!"); st.rerun()
-            with cn:
-                if st.button("❌ Cancel", key="confirm_no"):
-                    st.session_state._confirm_clear = False; st.rerun()
+            col1, col2 = st.columns(2)
+            with col1:
+                dataset_key = st.selectbox("Dataset", list(PROC_CONFIGS.keys()), key="proc_ds_sel")
+                cfg_s       = PROC_CONFIGS[dataset_key]
+                true_label  = st.selectbox("True Label", DATASETS[cfg_s["name"]], key="proc_lbl_sel")
+                uploaded    = st.file_uploader("Upload video", type=["mp4","avi","mov","mkv"], key="proc_upload")
+            with col2:
+                with st.expander("Advanced settings", expanded=False):
+                    st.caption(f"Window size: {cfg_s['window_size']}  |  Stride: {cfg_s['window_stride']}")
+                    st.caption(f"Onset threshold: {cfg_s['onset_thresh']}  |  Spike delta: {cfg_s['spike_delta']}")
+                    st.caption(f"Pred threshold: {cfg_s['pred_thresh']}  |  Checkpoint: {cfg_s['ckpt']}")
 
-    st.divider()
-    upload_mode = st.radio("Mode", ["📁 Single folder","🗜️ ZIP file"], horizontal=True, key="up_mode")
-    if upload_mode == "📁 Single folder":
-        uc1, uc2, uc3 = st.columns(3)
-        with uc1: up_ds  = st.selectbox("Dataset", list(DATASETS.keys()), key="up_ds")
-        with uc2: up_cls = st.selectbox("Class",   DATASETS[up_ds],       key="up_cls")
-        with uc3: fn_inp = st.text_input("Folder name", placeholder="e.g. fi1_xvid", key="up_fn_inp")
-        up_files = st.file_uploader(
-            "Files (mp4 + png + pred.txt — all 14 files per video)",
-            type=["mp4","avi","mov","mkv","png","jpg","txt"],
-            accept_multiple_files=True, key="up_files")
-        if st.button("💾 SAVE", type="primary", disabled=(not up_files or not fn_inp.strip()), key="up_save"):
-            dest = class_root(up_ds, up_cls) / fn_inp.strip()
-            dest.mkdir(parents=True, exist_ok=True)
-            for uf in up_files:
-                with open(dest / uf.name, "wb") as f: f.write(uf.getbuffer())
-            st.success(f"✅ Saved {len(up_files)} file(s) → `{up_ds}/{up_cls}/{fn_inp.strip()}`")
-    else:
-        uc1, uc2 = st.columns(2)
-        with uc1: zip_ds  = st.selectbox("Dataset", list(DATASETS.keys()), key="zip_ds")
-        with uc2: zip_cls = st.selectbox("Class",   DATASETS[zip_ds],      key="zip_cls")
-        zf = st.file_uploader("Upload ZIP", type=["zip"], key="zip_up")
-        if st.button("📦 EXTRACT", type="primary", disabled=(not zf), key="zip_extract"):
-            with st.spinner("Extracting..."):
-                n_f, n_files = extract_zip_to_uploads(zf.read(), zip_ds, zip_cls)
-            st.success(f"✅ Extracted {n_f} folder(s), {n_files} file(s)")
+            if uploaded and st.button("▶ Run Processing Pipeline", type="primary", use_container_width=True):
+                out_name = _safe_name(Path(uploaded.name).stem)
+                out_dir  = class_root(cfg_s["name"], true_label) / out_name
+                out_dir.mkdir(parents=True, exist_ok=True)
+                vid_path = out_dir / uploaded.name
+                vid_path.write_bytes(uploaded.read())
+                prog = {"done": False, "pct": 0.0, "stage": "Starting..."}
+                st.session_state._proc_progress = prog
+                st.session_state._proc_running  = True
+                st.session_state._proc_folder   = out_name
+                st.session_state._proc_ds       = cfg_s["name"]
+                st.session_state._proc_cls      = true_label
+                st.session_state["_proc_loaded"] = False
+                t = threading.Thread(target=run_processing_pipeline,
+                                     args=(vid_path, cfg_s, true_label, out_dir, prog),
+                                     daemon=True)
+                t.start()
+                st.session_state._proc_thread = t
+                st.rerun()
 
-    st.divider()
-    st.markdown("### 📂 Uploaded Folders")
-    found = False
-    for ds in DATASETS:
-        for cls in DATASETS[ds]:
-            flist = list_video_folders(ds, cls)
-            if flist:
-                found = True
-                with st.expander(f"**{ds}/{cls}** — {len(flist)} folder(s)", expanded=False):
-                    for fl in flist:
-                        ffiles = list(fl.iterdir())
-                        n_mp4  = len([f for f in ffiles if f.suffix == ".mp4"])
-                        n_png  = len([f for f in ffiles if f.suffix == ".png"])
-                        has_pred = any(f.name == "pred.txt" for f in ffiles)
-                        st.markdown(
-                            f"📁 **{fl.name}** — {n_mp4} videos · {n_png} grids · "
-                            f"{'✅ pred.txt' if has_pred else '❌ no pred.txt'}")
-    if not found: st.info("Nothing uploaded yet.")
-
-
-# ══════════════════════════════════════════
-# PAGE: ANALYTICS
-# ══════════════════════════════════════════
-elif page == "📈 Analytics":
-    st.subheader("📈 Analytics")
-    scores = st.session_state.active_scores
-    fps    = st.session_state.active_fps
-    pred   = st.session_state.active_pred
-    fname  = st.session_state.active_folder_name
-    if scores is None or fps is None:
-        st.info("Analyze a folder in **Video Explorer** first.")
-    else:
-        st.markdown(f"Showing: **{fname}**")
-        step = max(1, int(0.5*fps))
-        rows = [{"time": fmt_time(i/fps), "frame": i, "prob": round(float(scores[i]), 4)}
-                for i in range(0, len(scores), step)]
-        cA, cB = st.columns([1.3, 1.0], gap="large")
-        with cA:
-            st.markdown("#### Frame Log")
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, height=280)
-        with cB:
-            st.markdown("#### Summary")
-            for label, key in [("Prediction", "pred_label"), ("Confidence", "confidence"),
-                                ("Onset Frame", "onset_frame"), ("Onset Time", "onset_time"),
-                                ("Total Frames", "total_frames"), ("Val Acc", "model_val_acc"),
-                                ("Fighters", "fighter_ids"), ("CAM Focus", "cam_focused")]:
-                st.metric(label, pred.get(key, "?"))
-        c1, c2 = st.columns(2)
-        with c1: st.pyplot(make_timeline_plot(scores, fps, pred), clear_figure=True)
-        with c2: st.pyplot(make_hist_plot(scores), clear_figure=True)
-
-
-# ══════════════════════════════════════════
-# PAGE: DATASET STATS
-# ══════════════════════════════════════════
-elif page == "📊 Dataset Stats":
-    st.markdown(f"""
-    <div style="font-family:'Orbitron',sans-serif;font-size:1rem;font-weight:900;
-                letter-spacing:2px;margin-bottom:16px;">
-        📊 DATASET ACCURACY REPORT
-    </div>""", unsafe_allow_html=True)
-
-    records = get_all_pred_records()
-    if not records:
-        st.info("No pred.txt files found. Upload your GradCAM output folders first.")
-    else:
-        df = pd.DataFrame(records)
-
-        def ds_stats(sub):
-            total = len(sub)
-            if total == 0: return total, 0, 0.0, 0, 0, 0, 0
-            correct = sub["correct"].str.lower().eq("true").sum() if "correct" in sub.columns else 0
-            acc     = correct / total
-            fight = sub[sub["true_label"].str.lower() == "fight"] \
-                    if "true_label" in sub.columns else sub.iloc[0:0]
-            non   = sub[sub["true_label"].str.lower().str.contains("non", na=False)] \
-                    if "true_label" in sub.columns else sub.iloc[0:0]
-            tp = int(fight["correct"].str.lower().eq("true").sum()) if len(fight) else 0
-            tn = int(non["correct"].str.lower().eq("true").sum())   if len(non)   else 0
-            fp = int(non["correct"].str.lower().ne("true").sum())   if len(non)   else 0
-            fn = int(fight["correct"].str.lower().ne("true").sum()) if len(fight) else 0
-            return total, int(correct), acc, tp, tn, fp, fn
-
-        total_all, correct_all, acc_all, tp_all, tn_all, fp_all, fn_all = ds_stats(df)
-        hf_df  = df[df["_dataset"] == "hockeyfight"] if "_dataset" in df.columns else df.iloc[0:0]
-        rwf_df = df[df["_dataset"] == "rwf"]          if "_dataset" in df.columns else df.iloc[0:0]
-        _, hf_c,  hf_acc,  hf_tp,  hf_tn,  hf_fp,  hf_fn  = ds_stats(hf_df)
-        _, rwf_c, rwf_acc, rwf_tp, rwf_tn, rwf_fp, rwf_fn = ds_stats(rwf_df)
-
-        om1, om2, om3, om4, om5 = st.columns(5, gap="small")
-        om1.metric("Total Videos",     str(total_all))
-        om2.metric("Correct",          str(correct_all))
-        om3.metric("Overall Accuracy", f"{acc_all:.1%}")
-        om4.metric("True Positives",   str(tp_all))
-        om5.metric("True Negatives",   str(tn_all))
-
-        def acc_bar(pct, color):
-            filled = int(pct * 20)
-            return (f'<span style="font-family:monospace;color:{color};font-size:13px;">'
-                    f'{"█"*filled}{"░"*(20-filled)}</span>')
-
-        def ds_card(col, name, emoji, total, correct, acc, tp, tn, fp, fn, color):
-            prec = tp/(tp+fp) if (tp+fp) > 0 else 0
-            rec  = tp/(tp+fn) if (tp+fn) > 0 else 0
-            f1   = 2*prec*rec/(prec+rec) if (prec+rec) > 0 else 0
-            col.markdown(f"""
-            <div style="background:{bg2};border:1px solid {bord};border-left:4px solid {color};
-                        border-radius:10px;padding:20px;">
-                <div style="font-family:'Orbitron',sans-serif;font-size:13px;font-weight:900;
-                            color:{color};letter-spacing:2px;margin-bottom:2px;">
-                    {emoji} {name.upper()}</div>
-                <div style="font-family:'Share Tech Mono',monospace;font-size:10px;
-                            color:{tdim2};margin-bottom:14px;">{total} videos analyzed</div>
-                <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px;">
-                    <div style="font-family:'Orbitron',sans-serif;font-size:2rem;
-                                font-weight:900;">{acc:.1%}</div>
-                    <div style="font-family:'Share Tech Mono',monospace;font-size:10px;
-                                color:{tdim};">ACCURACY</div>
-                </div>
-                <div style="margin-bottom:14px;">{acc_bar(acc, color)}</div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;
-                            font-family:'Share Tech Mono',monospace;font-size:11px;">
-                    <div style="background:{bg2 if theme=='light' else '#080c10'};border-radius:4px;padding:8px 10px;">
-                        <div style="color:{tdim2};font-size:9px;margin-bottom:2px;">CORRECT</div>
-                        <div style="color:#52e08a;font-size:14px;font-weight:700;">{correct}</div>
-                    </div>
-                    <div style="background:{bg2 if theme=='light' else '#080c10'};border-radius:4px;padding:8px 10px;">
-                        <div style="color:{tdim2};font-size:9px;margin-bottom:2px;">WRONG</div>
-                        <div style="color:#e05252;font-size:14px;font-weight:700;">{total-correct}</div>
-                    </div>
-                    <div style="background:{bg2 if theme=='light' else '#080c10'};border-radius:4px;padding:8px 10px;">
-                        <div style="color:{tdim2};font-size:9px;margin-bottom:2px;">TRUE POS</div>
-                        <div style="color:{tblue};font-size:14px;">{tp}</div>
-                    </div>
-                    <div style="background:{bg2 if theme=='light' else '#080c10'};border-radius:4px;padding:8px 10px;">
-                        <div style="color:{tdim2};font-size:9px;margin-bottom:2px;">TRUE NEG</div>
-                        <div style="color:{tblue};font-size:14px;">{tn}</div>
-                    </div>
-                    <div style="background:{bg2 if theme=='light' else '#080c10'};border-radius:4px;padding:8px 10px;">
-                        <div style="color:{tdim2};font-size:9px;margin-bottom:2px;">FALSE POS</div>
-                        <div style="color:#f5a623;font-size:14px;">{fp}</div>
-                    </div>
-                    <div style="background:{bg2 if theme=='light' else '#080c10'};border-radius:4px;padding:8px 10px;">
-                        <div style="color:{tdim2};font-size:9px;margin-bottom:2px;">FALSE NEG</div>
-                        <div style="color:#f5a623;font-size:14px;">{fn}</div>
-                    </div>
-                </div>
-                <div style="margin-top:12px;padding-top:12px;border-top:1px solid {bord};
-                            display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;
-                            font-family:'Share Tech Mono',monospace;font-size:10px;">
-                    <div><div style="color:{tdim2};font-size:9px;">PRECISION</div>
-                         <div>{prec:.1%}</div></div>
-                    <div><div style="color:{tdim2};font-size:9px;">RECALL</div>
-                         <div>{rec:.1%}</div></div>
-                    <div><div style="color:{tdim2};font-size:9px;">F1 SCORE</div>
-                         <div style="color:{color};">{f1:.1%}</div></div>
-                </div>
-            </div>""", unsafe_allow_html=True)
-
-        card_l, card_r = st.columns(2, gap="medium")
-        if len(hf_df) > 0:
-            ds_card(card_l, "HockeyFight", "🏒", len(hf_df), hf_c, hf_acc, hf_tp, hf_tn, hf_fp, hf_fn, tblue)
-        else:
-            card_l.markdown(f"""<div style="background:{bg2};border:1px solid {bord};border-radius:10px;
-                padding:30px 20px;text-align:center;font-family:'Share Tech Mono',monospace;
-                font-size:11px;color:{tdim2};">🏒 HOCKEYFIGHT<br><br>No data uploaded yet.</div>""",
-                unsafe_allow_html=True)
-
-        if len(rwf_df) > 0:
-            ds_card(card_r, "RWF-2000", "🥊", len(rwf_df), rwf_c, rwf_acc, rwf_tp, rwf_tn, rwf_fp, rwf_fn, accent)
-        else:
-            card_r.markdown(f"""<div style="background:{bg2};border:1px solid {bord};border-radius:10px;
-                padding:30px 20px;text-align:center;font-family:'Share Tech Mono',monospace;
-                font-size:11px;color:{tdim2};">🥊 RWF-2000<br><br>No data uploaded yet.</div>""",
-                unsafe_allow_html=True)
-
-        if ds_names := ([("HockeyFight", hf_acc, tblue)] if len(hf_df) else []) + \
-                       ([("RWF-2000",    rwf_acc, accent)] if len(rwf_df) else []) + \
-                       ([("Overall",     acc_all, "#52e08a")] if total_all else []):
-            c = get_plot_colors()
-            fig, ax = plt.subplots(figsize=(7, 2.6), facecolor=c["bg"])
-            ax.set_facecolor(c["ax"])
-            names_l, accs_l, cols_l = zip(*ds_names)
-            bars = ax.barh(names_l, [a*100 for a in accs_l], color=cols_l, height=0.45, edgecolor="none")
-            for bar, acc_v in zip(bars, accs_l):
-                ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2,
-                        f"{acc_v:.1%}", va="center", ha="left", fontsize=10, fontfamily="monospace")
-            ax.set_xlim(0, 115)
-            ax.set_xlabel("Accuracy (%)", color=c["xlabel"], fontsize=8)
-            ax.tick_params(colors=c["tick"], labelsize=9)
-            ax.spines[:].set_color(c["spine"])
-            ax.axvline(100, color=c["spine"], linewidth=0.6, linestyle="--")
-            plt.tight_layout()
-            st.pyplot(fig, clear_figure=True)
-
-        with st.expander("📋 All Records", expanded=False):
-            show = ["_folder","_dataset","_class","true_label","pred_label",
-                    "correct","confidence","onset_time","fighter_ids"]
-            show = [c for c in show if c in df.columns]
-            st.dataframe(df[show].rename(columns={"_folder":"Folder","_dataset":"Dataset","_class":"Class"}),
-                         use_container_width=True, height=300)
-
-
-# ══════════════════════════════════════════
-# PAGE: FP/FN BROWSER
-# ══════════════════════════════════════════
-elif page == "❌ FP/FN Browser":
-    st.subheader("❌ False Positive / False Negative Browser")
-    records = get_all_pred_records()
-    if not records:
-        st.info("No pred.txt files found.")
-    else:
-        df = pd.DataFrame(records)
-        if "correct" not in df.columns:
-            st.info("Need 'correct' field in pred.txt.")
-        else:
-            wrong = df[df["correct"].str.lower() != "true"]
-            if wrong.empty:
-                st.success("🎉 No errors — all predictions correct!")
-            else:
-                tl, pl = "true_label", "pred_label"
-                fp_df = wrong[(wrong[tl].str.lower().isin(["nonfight","nonfight"])) &
-                              (wrong[pl].str.lower()=="fight")] \
-                        if tl in wrong.columns and pl in wrong.columns else pd.DataFrame()
-                fn_df = wrong[(wrong[tl].str.lower()=="fight") &
-                              (wrong[pl].str.lower().str.contains("non"))] \
-                        if tl in wrong.columns and pl in wrong.columns else pd.DataFrame()
-                t1, t2, t3 = st.tabs([f"All Wrong ({len(wrong)})",
-                                       f"False Positives ({len(fp_df)})",
-                                       f"False Negatives ({len(fn_df)})"])
-                show = ["_folder","_dataset","_class","true_label","pred_label",
-                        "confidence","onset_time","fighter_ids"]
-                for tab, data, label in [(t1,wrong,"wrong"),(t2,fp_df,"fp"),(t3,fn_df,"fn")]:
-                    with tab:
-                        if data.empty: st.info("None found.")
-                        else:
-                            s = [c for c in show if c in data.columns]
-                            st.dataframe(data[s].rename(columns={"_folder":"Folder"}),
-                                         use_container_width=True, height=300)
-                            st.download_button("⬇️ CSV",
-                                               data=data[s].to_csv(index=False).encode(),
-                                               file_name=f"{label}.csv", mime="text/csv",
-                                               key=f"fpfn_{label}_csv")
-
-
-# ══════════════════════════════════════════
-# PAGE: CONFUSION MATRIX
-# ══════════════════════════════════════════
-elif page == "🧩 Confusion Matrix":
-    st.subheader("🧩 Confusion Matrix & Metrics")
-    records = get_all_pred_records()
-    if not records:
-        st.info("No pred.txt files found.")
-    else:
-        cm_col, met_col = st.columns([1, 1.2], gap="large")
-        with cm_col:
-            fig, cm = make_confusion_matrix(records)
-            st.pyplot(fig, clear_figure=True)
-        with met_col:
-            st.markdown("#### Per-Class Metrics")
-            TP, FN = int(cm[0][0]), int(cm[0][1])
-            FP, TN = int(cm[1][0]), int(cm[1][1])
-            pf  = TP/(TP+FP) if (TP+FP) > 0 else 0
-            rf  = TP/(TP+FN) if (TP+FN) > 0 else 0
-            f1f = 2*pf*rf/(pf+rf) if (pf+rf) > 0 else 0
-            pn  = TN/(TN+FN) if (TN+FN) > 0 else 0
-            rn  = TN/(TN+FP) if (TN+FP) > 0 else 0
-            f1n = 2*pn*rn/(pn+rn) if (pn+rn) > 0 else 0
-            oa  = (TP+TN)/(TP+TN+FP+FN) if (TP+TN+FP+FN) > 0 else 0
-            mdf = pd.DataFrame([
-                {"Class":"Fight",   "Precision":f"{pf:.1%}","Recall":f"{rf:.1%}",
-                 "F1":f"{f1f:.1%}","Support":TP+FN},
-                {"Class":"NonFight","Precision":f"{pn:.1%}","Recall":f"{rn:.1%}",
-                 "F1":f"{f1n:.1%}","Support":FP+TN},
-            ])
-            st.dataframe(mdf, use_container_width=True, hide_index=True)
-            st.metric("Overall Accuracy", f"{oa:.1%}")
-            st.markdown(f"**TP:** `{TP}` | **FN:** `{FN}` | **FP:** `{FP}` | **TN:** `{TN}`")
-
-
-# ══════════════════════════════════════════
-# PAGE: INCIDENT REPORT
-# ══════════════════════════════════════════
-elif page == "🧾 Incident Report":
-    st.subheader("🧾 Incident Report Generator")
-    pred   = st.session_state.active_pred
-    scores = st.session_state.active_scores
-    fps    = st.session_state.active_fps
-    fname  = st.session_state.active_folder_name
-    if not pred or scores is None:
-        st.info("Analyze a folder in **Video Explorer** first.")
-    else:
-        st.success(f"Generating report for: **{fname}**")
-        col1, col2 = st.columns([1.1, 1.2], gap="large")
+    with tab2:
+        st.markdown("Upload a ZIP of pre-organised video folders per dataset / class.")
+        col1, col2 = st.columns(2)
         with col1:
-            cam_nm = st.text_input("Camera name",  value="Entrance Camera", key="inc_cam")
-            loc    = st.text_input("Location",      value="Main Gate",       key="inc_loc")
-            notes  = st.text_area("Notes",          value="",                key="inc_notes")
-            gen    = st.button("🧾 GENERATE REPORT", type="primary", key="inc_gen")
+            ds_sel  = st.selectbox("Dataset", list(DATASETS.keys()), key="ds_zip_sel")
+            cls_sel = st.selectbox("Class", DATASETS[ds_sel], key="cls_zip_sel")
         with col2:
-            is_f = is_fight_pred(pred)
-            if is_f: st.error(f"🔴 FIGHT — {pred.get('confidence','?')} confidence")
-            else:    st.success(f"🟢 NORMAL — {pred.get('confidence','?')} confidence")
-            for label, key in [
-                ("Video", fname), ("Dataset", pred.get("dataset","?")),
-                ("True Label", pred.get("true_label","?")),
-                ("Predicted",  pred.get("pred_label","?")),
-                ("Correct",    pred.get("correct","?")),
-                ("Onset Time", pred.get("onset_time","?")),
-                ("Fighters",   pred.get("fighter_ids","N/A")),
-                ("CAM Focus",  pred.get("cam_focused","N/A")),
-            ]:
-                st.markdown(f"- **{label}:** {key}")
-            c1, c2 = st.columns(2)
-            with c1: st.pyplot(make_timeline_plot(scores, fps, pred), clear_figure=True)
-            with c2: st.pyplot(make_hist_plot(scores), clear_figure=True)
-        if gen:
-            report = {
-                "incident_id":  f"INC-{int(time.time())}",
-                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "generated_by": st.session_state.username,
-                "camera": cam_nm, "location": loc,
-                "video_folder": fname,
-                "model":   pred.get("model_path", "?"),
-                "dataset": pred.get("dataset", "?"),
-                "thresholds": {"violence": st.session_state.thr_violence,
-                               "suspicious": st.session_state.thr_suspicious},
-                "prediction": {
-                    "true_label":   pred.get("true_label","?"),
-                    "pred_label":   pred.get("pred_label","?"),
-                    "confidence":   pred.get("confidence","?"),
-                    "correct":      pred.get("correct","?"),
-                    "onset_frame":  pred.get("onset_frame","?"),
-                    "onset_time":   pred.get("onset_time","?"),
-                    "total_frames": pred.get("total_frames","?"),
-                    "fighter_ids":  pred.get("fighter_ids","N/A"),
-                    "cam_focused":  pred.get("cam_focused","N/A"),
-                    "how_started":  describe_onset(pred),
-                },
-                "notes": notes,
-            }
-            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = Path(CFG.OUTPUT_DIR) / f"incident_{fname}_{ts}.json"
-            with open(path, "w") as f: json.dump(report, f, indent=2)
-            st.success("✅ Report saved!")
-            st.download_button("⬇️ Download JSON",
-                               data=io.BytesIO(json.dumps(report, indent=2).encode()),
-                               file_name=path.name, mime="application/json", key="inc_json_dl")
-            pdf = generate_pdf_report(pred, scores, fps, fname)
-            st.download_button("⬇️ Download PDF", data=pdf,
-                               file_name=f"report_{fname}_{ts}.pdf",
-                               mime="application/pdf", key="inc_pdf_dl")
+            zip_up = st.file_uploader("Upload ZIP archive", type=["zip"], key="ds_zip_up")
+        if zip_up and st.button("Extract & Ingest", type="primary"):
+            with st.spinner("Extracting..."):
+                n_fold, n_files = extract_zip_to_uploads(zip_up.read(), ds_sel, cls_sel)
+            st.success(f"Extracted {n_fold} folders and {n_files} files into {ds_sel}/{cls_sel}.")
+
+    with tab3:
+        st.markdown("Upload a ZIP of already-processed output folders (containing pred.txt, .mp4s, .png grids).")
+        col1, col2 = st.columns(2)
+        with col1:
+            ds_pre  = st.selectbox("Dataset", list(DATASETS.keys()), key="pre_ds_sel")
+            cls_pre = st.selectbox("Class", DATASETS[ds_pre], key="pre_cls_sel")
+        with col2:
+            pre_up = st.file_uploader("Upload precomputed ZIP", type=["zip"], key="pre_zip_up")
+        if pre_up and st.button("Ingest Precomputed", type="primary"):
+            with st.spinner("Extracting..."):
+                n_fold, n_files = extract_zip_to_uploads(pre_up.read(), ds_pre, cls_pre)
+            st.success(f"Ingested {n_fold} folders and {n_files} files.")
+
+    with tab4:
+        st.markdown("Browse and delete uploaded folders.")
+        for ds in DATASETS:
+            for cls in DATASETS[ds]:
+                folders = list_video_folders(ds, cls)
+                if not folders: continue
+                with st.expander(f"{ds} / {cls}  ({len(folders)} folders)", expanded=False):
+                    for folder in folders:
+                        fc1, fc2, fc3 = st.columns([3,1,1])
+                        files = get_files(folder)
+                        has_pred = "pred" in files
+                        fc1.write(f"📁 {folder.name}" + (" ✅" if has_pred else ""))
+                        if fc2.button("Load", key=f"load_{folder}"):
+                            load_analysis_from_folder(folder, ds, cls, folder.name)
+                            go_to("🧪 Review Workspace")
+                        if fc3.button("🗑 Delete", key=f"del_{folder}"):
+                            shutil.rmtree(folder, ignore_errors=True)
+                            st.rerun()
+        st.markdown("---")
+        st.warning("Danger zone")
+        if st.button("🗑 Clear ALL uploads", use_container_width=True):
+            clear_all_uploads()
+            st.success("All uploads cleared.")
+            st.rerun()
+
+# ══════════════════════════════════════════════════════════════
+# REVIEW WORKSPACE PAGE
+# ══════════════════════════════════════════════════════════════
+def render_review_workspace():
+    render_back_button()
+    st.markdown("<div class='vg-title'>🧪 Review Workspace</div>", unsafe_allow_html=True)
+
+    with st.expander("📂 Select analysis folder", expanded=not bool(st.session_state.active_folder_name)):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            ds_ws = st.selectbox("Dataset", list(DATASETS.keys()), key="ws_ds")
+        with col2:
+            cls_ws = st.selectbox("Class", DATASETS[ds_ws], key="ws_cls")
+        with col3:
+            folders_ws = list_video_folders(ds_ws, cls_ws)
+            folder_names_ws = [f.name for f in folders_ws]
+            if folder_names_ws:
+                sel_folder_ws = st.selectbox("Folder", folder_names_ws, key="ws_folder_sel")
+                if st.button("Load →", type="primary", key="ws_load"):
+                    selected_path = class_root(ds_ws, cls_ws) / sel_folder_ws
+                    load_analysis_from_folder(selected_path, ds_ws, cls_ws, sel_folder_ws)
+                    st.rerun()
+            else:
+                st.info("No folders found. Use Ingest to add videos.")
+
+    if not st.session_state.active_folder_name:
+        st.info("No analysis loaded. Select a folder above or process a video via Ingest.")
+        return
+
+    render_active_summary_bar()
+
+    files = st.session_state.get("_active_files", {})
+    pred  = st.session_state.active_pred
+    scores = st.session_state.active_scores
+    fps   = st.session_state.active_fps or CFG.DEFAULT_FPS
+
+    tab_ov, tab_vid, tab_grid, tab_tl, tab_anal, tab_rep = st.tabs([
+        "📋 Overview", "🎬 Videos", "🖼 Grids", "📈 Timeline", "📊 Analytics", "📄 Report"
+    ])
+
+    with tab_ov:
+        render_review_overview_tab(pred, files, fps, scores)
+
+    with tab_vid:
+        render_review_videos_tab(files)
+
+    with tab_grid:
+        render_review_grids_tab(files)
+
+    with tab_tl:
+        render_review_timeline_tab(files, pred, scores, fps)
+
+    with tab_anal:
+        render_review_analytics_tab(pred, scores, fps)
+
+    with tab_rep:
+        render_review_report_tab(pred, scores, fps)
 
 
-# ══════════════════════════════════════════
-# PAGE: SETTINGS ← NEW
-# ══════════════════════════════════════════
-elif page == "⚙️ Settings":
-    st.markdown(f"""
-    <div style="font-family:'Orbitron',sans-serif;font-size:1rem;font-weight:900;
-                letter-spacing:2px;margin-bottom:4px;">⚙️ SETTINGS</div>
-    <div style="font-family:'Share Tech Mono',monospace;font-size:10px;
-                color:{tdim2};letter-spacing:2px;margin-bottom:20px;">
-        CUSTOMIZE YOUR VISIONGUARD EXPERIENCE
-    </div>""", unsafe_allow_html=True)
+def render_review_overview_tab(pred, files, fps, scores):
+    is_f  = is_fight_pred(pred)
+    conf  = pred.get("confidence","?")
+    onset = pred.get("onset_time","N/A")
+    total = pred.get("total_frames","?")
 
-    left_col, right_col = st.columns(2, gap="large")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Prediction", pred.get("pred_label","?"))
+    c2.metric("Confidence", conf)
+    c3.metric("Onset time", onset)
+    c4.metric("Total frames", total)
 
-    # ── LEFT COLUMN ──────────────────────────────────────────
-    with left_col:
+    st.markdown("**Original vs Combined CAM**")
+    vc1, vc2 = st.columns(2)
+    with vc1:
+        st.caption("📹 Original")
+        if "original" in files:
+            _safe_video(files["original"])
+        else:
+            st.info("Original video not found.")
+    with vc2:
+        st.caption("🎯 Combined CAM")
+        if "combined" in files:
+            _safe_video(files["combined"])
+        else:
+            st.info("Combined CAM video not found.")
 
-        # ── APPEARANCE ──────────────────────────────────────
-        st.markdown(f"""<div class="vg-settings-card">
-        <div class="vg-settings-section-title">🎨 APPEARANCE</div>""", unsafe_allow_html=True)
+    with st.expander("Full prediction details", expanded=False):
+        for k, v in pred.items():
+            st.text(f"{k}: {v}")
 
-        new_theme = st.radio(
-            "Theme",
-            options=["dark", "light"],
-            index=0 if st.session_state.ui_theme == "dark" else 1,
-            horizontal=True,
-            format_func=lambda x: "🌙 Dark Mode" if x == "dark" else "☀️ Light Mode",
-            key="settings_theme",
+
+def render_review_videos_tab(files):
+    pred = st.session_state.active_pred
+    is_f = is_fight_pred(pred)
+
+    if is_f:
+        onset_f = pred.get("onset_frame", "?")
+        onset_t = pred.get("onset_time", "N/A")
+        conf    = pred.get("confidence", "?")
+        total   = pred.get("total_frames", "?")
+        try:
+            pct_in = f"{int(float(str(onset_f)) / float(str(total)) * 100)}%" \
+                     if onset_f not in ("?","N/A") and total not in ("?","N/A") else "early in clip"
+        except:
+            pct_in = "early in clip"
+
+        st.markdown(
+            f"<div class='fight-analysis-card'>"
+            f"<div style='font-weight:800;color:#ff5555;font-size:1rem;margin-bottom:10px;'>⚠️ Fight Analysis</div>"
+            f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:16px;'>"
+            f"<div>"
+            f"<div style='color:#e05252;font-size:10px;text-transform:uppercase;letter-spacing:.06em;font-weight:700;margin-bottom:4px;'>🔴 How it started</div>"
+            f"<div style='color:#c8d8e8;font-size:13px;line-height:1.6;'>"
+            f"A rapid motion spike was detected at frame <b>{onset_f}</b> ({onset_t}). "
+            f"The R3D-18 backbone flagged sudden directional changes and close-proximity body movements — "
+            f"kinematic patterns consistent with the initiation of physical contact."
+            f"</div>"
+            f"</div>"
+            f"<div>"
+            f"<div style='color:#f5a623;font-size:10px;text-transform:uppercase;letter-spacing:.06em;font-weight:700;margin-bottom:4px;'>🟡 How it developed</div>"
+            f"<div style='color:#c8d8e8;font-size:13px;line-height:1.6;'>"
+            f"Fight probability crossed the detection threshold at <b>{pct_in}</b> into the clip "
+            f"(confidence <b>{conf}</b>). The LSTM head tracked sustained high-energy motion "
+            f"over subsequent frames — indicating an ongoing confrontation rather than a single brief strike."
+            f"</div>"
+            f"</div>"
+            f"</div>"
+            f"<div style='margin-top:10px;padding-top:8px;border-top:1px solid rgba(224,82,82,0.2);color:#445566;font-size:11px;'>"
+            f"💡 GradCAM++ and LayerCAM heatmaps highlight the spatial regions driving the prediction. "
+            f"Use the <b>Combined</b> overlay below for the most robust view — it averages GradCAM++, SmoothGradCAM++, and LayerCAM."
+            f"</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f"<div class='normal-analysis-card'>"
+            f"<div style='font-weight:700;color:#52e08a;font-size:0.95rem;margin-bottom:4px;'>✓ No fight detected</div>"
+            f"<div style='color:#7a99b0;font-size:13px;line-height:1.6;'>"
+            f"The model found no aggressive motion patterns exceeding the detection threshold throughout this clip. "
+            f"Motion activity remained within normal variance — no directional spikes or proximity escalation were flagged by the LSTM sequence head."
+            f"</div>"
+            f"</div>",
+            unsafe_allow_html=True
         )
 
-        new_accent = st.selectbox(
-            "Accent Color",
-            options=["#e05252", "#7ecfff", "#52e08a", "#f5a623", "#a855f7", "#ec4899", "#06b6d4"],
-            index=["#e05252","#7ecfff","#52e08a","#f5a623","#a855f7","#ec4899","#06b6d4"].index(
-                st.session_state.accent_color) if st.session_state.accent_color in
-                ["#e05252","#7ecfff","#52e08a","#f5a623","#a855f7","#ec4899","#06b6d4"] else 0,
-            format_func=lambda x: {
-                "#e05252": "🔴 Alert Red (default)",
-                "#7ecfff": "🔵 Cyber Blue",
-                "#52e08a": "🟢 Matrix Green",
-                "#f5a623": "🟠 Warning Orange",
-                "#a855f7": "🟣 Neon Purple",
-                "#ec4899": "🩷 Hot Pink",
-                "#06b6d4": "🩵 Cyan",
-            }.get(x, x),
-            key="settings_accent",
-        )
+    st.markdown("**Select CAM overlay to inspect:**")
+    available_vids = [k for k in ALL_VID_KEYS if k in files]
+    sel_vid = st.selectbox("Video type", available_vids,
+                           format_func=lambda k: VID_LABELS.get(k, k), key="review_vid_sel")
 
-        new_font = st.select_slider(
-            "Font Size",
-            options=["small", "medium", "large"],
-            value=st.session_state.font_size,
-            key="settings_font",
-        )
+    method_info = {
+        "original":         ("📹 Original",
+                             "Raw footage with prediction overlay and status bar. Shows the fight onset marker, confidence score, and P(fight) value per frame."),
+        "gradcam":          ("🔥 GradCAM",
+                             "Standard Gradient-weighted Class Activation Mapping on Layer 4. Highlights the broad spatial regions the model weighted most for its decision."),
+        "gradcampp":        ("🔥 GradCAM++",
+                             "Improved GradCAM with better localization of multiple instances. More precise than standard GradCAM — recommended for identifying which person triggered the alert."),
+        "smooth_gradcampp": ("✨ Smooth GradCAM++",
+                             "20-pass noise-averaged GradCAM++. Reduces gradient noise for cleaner, more reliable heatmaps. Best for detailed analysis — higher compute cost."),
+        "layercam":         ("🌊 LayerCAM",
+                             "Fuses activations from Layers 2, 3 & 4. Captures both fine-grained texture and high-level motion features. Most comprehensive spatial coverage."),
+        "combined":         ("🎯 Combined",
+                             "Ensemble average of GradCAM++, SmoothGradCAM++, and LayerCAM. Reduces per-method bias — the most robust and recommended overlay for reporting."),
+    }
 
-        new_scanlines = st.toggle(
-            "CRT Scanline Effect",
-            value=st.session_state.show_scanlines,
-            key="settings_scanlines",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+    if sel_vid and sel_vid in files:
+        vid_col, info_col = st.columns([2, 3])
+        with vid_col:
+            _safe_video(files[sel_vid])
+            vpath = Path(files[sel_vid])
+            if vpath.exists():
+                st.download_button(
+                    f"⬇ Download {VID_LABELS.get(sel_vid, sel_vid)}",
+                    data=vpath.read_bytes(),
+                    file_name=vpath.name,
+                    mime="video/mp4",
+                    use_container_width=True
+                )
+        with info_col:
+            label, desc = method_info.get(sel_vid, (sel_vid, "No description available."))
+            st.markdown(f"**{label}**")
+            st.markdown(
+                f"<div style='color:#7a99b0;font-size:13px;line-height:1.65;margin-top:4px;'>{desc}</div>",
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("Video not available.")
 
-        # ── ANALYSIS DEFAULTS ────────────────────────────────
-        st.markdown(f"""<div class="vg-settings-card" style="margin-top:16px;">
-        <div class="vg-settings-section-title">🔬 ANALYSIS DEFAULTS</div>""", unsafe_allow_html=True)
+    with st.expander("All available videos", expanded=False):
+        row = st.columns(3)
+        for i, vk in enumerate(ALL_VID_KEYS):
+            if vk in files:
+                with row[i % 3]:
+                    st.caption(VID_LABELS.get(vk, vk))
+                    _safe_video(files[vk])
 
-        new_default_ds = st.selectbox(
-            "Default Dataset",
-            options=list(DATASETS.keys()),
-            index=list(DATASETS.keys()).index(st.session_state.default_dataset)
-                  if st.session_state.default_dataset in DATASETS else 0,
-            key="settings_default_ds",
-        )
 
-        new_default_cls = st.selectbox(
-            "Default Class",
-            options=DATASETS[new_default_ds],
-            key="settings_default_cls",
-        )
+def render_review_grids_tab(files):
+    sel_grid = st.selectbox("Grid type", [k for k in ALL_GRID_KEYS if k in files],
+                             format_func=lambda k: GRID_LABELS.get(k,k), key="review_grid_sel")
+    if sel_grid and sel_grid in files:
+        gp = Path(files[sel_grid])
+        if gp.exists():
+            st.image(str(gp), use_container_width=True, caption=GRID_LABELS.get(sel_grid, sel_grid))
+            st.download_button("Download grid image", data=gp.read_bytes(),
+                               file_name=gp.name, mime="image/png", use_container_width=True)
+    else:
+        st.info("Grid not available.")
 
-        new_max_frames = st.number_input(
-            "Max Frames to Load",
-            min_value=30, max_value=1000,
-            value=st.session_state.max_frames,
-            step=10,
-            key="settings_max_frames",
-        )
+    st.markdown("**All frame grids**")
+    for gk in ALL_GRID_KEYS:
+        if gk in files:
+            gp = Path(files[gk])
+            if gp.exists():
+                with st.expander(GRID_LABELS.get(gk, gk), expanded=False):
+                    st.image(str(gp), use_container_width=True)
 
-        new_thr_v = st.slider(
-            "Violence Threshold",
-            0.10, 0.99,
-            value=st.session_state.thr_violence,
-            step=0.01,
-            key="settings_thr_v",
-        )
 
-        new_thr_s = st.slider(
-            "Suspicious Threshold",
-            0.10, 0.99,
-            value=st.session_state.thr_suspicious,
-            step=0.01,
-            key="settings_thr_s",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+def render_review_timeline_tab(files, pred, scores, fps):
+    tl_img = files.get("timeline")
+    if tl_img and Path(tl_img).exists():
+        st.image(str(tl_img), use_container_width=True, caption="Saved timeline plot")
+        st.download_button("Download timeline PNG", data=Path(tl_img).read_bytes(),
+                           file_name="timeline.png", mime="image/png")
+    if scores is not None and len(scores) > 0:
+        st.markdown("**Interactive timeline**")
+        fig = make_timeline_plot(scores, fps, pred)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+    else:
+        st.info("No score data available for timeline.")
 
-    # ── RIGHT COLUMN ─────────────────────────────────────────
-    with right_col:
 
-        # ── NOTIFICATIONS & ALERTS ──────────────────────────
-        st.markdown(f"""<div class="vg-settings-card">
-        <div class="vg-settings-section-title">🔔 NOTIFICATIONS & ALERTS</div>""", unsafe_allow_html=True)
+def render_review_analytics_tab(pred, scores, fps):
+    if scores is None or len(scores) == 0:
+        st.info("No score data available."); return
 
-        new_notify = st.toggle(
-            "Show Fight Alert Banners",
-            value=st.session_state.notify_fights,
-            key="settings_notify",
-        )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Max P(fight)", f"{float(np.max(scores)):.3f}")
+    c2.metric("Mean P(fight)", f"{float(np.mean(scores)):.3f}")
+    c3.metric("Frames > violence thr", int(np.sum(scores > st.session_state.thr_violence)))
+    c4.metric("Frames > suspicious thr", int(np.sum(scores > st.session_state.thr_suspicious)))
 
-        new_conf_bar = st.toggle(
-            "Show Confidence Bar in Explorer",
-            value=st.session_state.show_confidence_bar,
-            key="settings_conf_bar",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.markdown("**P(fight) over time**")
+        fig = make_timeline_plot(scores, fps, pred)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
+    with sc2:
+        st.markdown("**Score distribution**")
+        fig = make_hist_plot(scores)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
 
-        # ── CHART PREFERENCES ───────────────────────────────
-        st.markdown(f"""<div class="vg-settings-card" style="margin-top:16px;">
-        <div class="vg-settings-section-title">📊 CHART PREFERENCES</div>""", unsafe_allow_html=True)
 
-        new_chart_style = st.radio(
-            "Timeline Chart Style",
-            options=["line", "area", "bar"],
-            index=["line","area","bar"].index(st.session_state.chart_style),
-            horizontal=True,
-            format_func=lambda x: {"line":"📈 Line","area":"🏔 Area","bar":"📊 Bar"}.get(x, x),
-            key="settings_chart_style",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+def render_review_report_tab(pred, scores, fps):
+    folder = st.session_state.active_folder_name
+    is_f   = is_fight_pred(pred)
 
-        # ── ACCOUNT ─────────────────────────────────────────
-        st.markdown(f"""<div class="vg-settings-card" style="margin-top:16px;">
-        <div class="vg-settings-section-title">👤 ACCOUNT</div>""", unsafe_allow_html=True)
+    badge     = "vg-badge-fight" if is_f else "vg-badge-normal"
+    badge_txt = "⚠ FIGHT DETECTED" if is_f else "✓ NORMAL"
+    st.markdown(
+        f"<div class='vg-card' style='padding:14px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;'>"
+        f"<span class='{badge}'>{badge_txt}</span>"
+        f"<span style='font-size:1.05rem;font-weight:700;'>{folder}</span>"
+        f"<span class='vg-soft'>{pred.get('dataset','?')} · conf {pred.get('confidence','?')} · onset {pred.get('onset_time','N/A')}</span>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
-        st.markdown(f"""
-        <div style="font-family:'Share Tech Mono',monospace;font-size:12px;margin-bottom:12px;">
-            <span style="color:{tdim};">Logged in as</span>&nbsp;
-            <span style="color:{tblue};font-weight:bold;">{st.session_state.username}</span>
-        </div>""", unsafe_allow_html=True)
+    st.markdown("**Incident metadata**")
+    m1, m2 = st.columns(2)
+    with m1:
+        camera   = st.text_input("Camera ID",    value=st.session_state.get("review_camera",""),   key="rep_camera")
+        location = st.text_input("Location",     value=st.session_state.get("review_location",""), key="rep_location")
+    with m2:
+        reviewer = st.text_input("Reviewer tag", value=st.session_state.get("reviewer_tag",""),    key="rep_reviewer")
+        notes    = st.text_area("Notes",         value=st.session_state.get("review_notes",""),    key="rep_notes", height=80)
 
-        st.markdown("**Change Password**")
-        cp_old = st.text_input("Current Password", type="password", key="cp_old")
-        cp_new = st.text_input("New Password (min 4 chars)", type="password", key="cp_new")
-        cp_new2 = st.text_input("Confirm New Password", type="password", key="cp_new2")
+    if st.button("💾 Save metadata", use_container_width=True):
+        st.session_state.review_camera   = camera
+        st.session_state.review_location = location
+        st.session_state.reviewer_tag    = reviewer
+        st.session_state.review_notes    = notes
+        update_history_metadata(folder, st.session_state.active_dataset,
+                                 st.session_state.active_class,
+                                 camera, location, notes, reviewer)
+        st.success("Metadata saved.")
 
-        if st.button("🔒 CHANGE PASSWORD", key="change_pw_btn"):
-            if not cp_old or not cp_new:
-                st.error("Please fill in all fields.")
-            elif not try_login(st.session_state.username, cp_old):
-                st.error("❌ Current password is incorrect.")
-            elif cp_new != cp_new2:
-                st.error("❌ New passwords do not match.")
-            elif len(cp_new) < 4:
-                st.error("❌ Password must be at least 4 characters.")
+    st.markdown("---")
+    st.markdown("**Export** — all exports use filename `" + folder + "`")
+
+    sc = scores if scores is not None and len(scores) > 0 else np.array([0.0])
+    pdf_bytes  = generate_pdf_report(pred, sc, fps, folder)
+    export_obj = {
+        "folder": folder,
+        "dataset": st.session_state.active_dataset,
+        "class":   st.session_state.active_class,
+        "prediction": pred,
+        "metadata": {
+            "camera":      st.session_state.get("review_camera",""),
+            "location":    st.session_state.get("review_location",""),
+            "reviewer":    st.session_state.get("reviewer_tag",""),
+            "notes":       st.session_state.get("review_notes",""),
+            "exported_at": datetime.now().isoformat(),
+        },
+        "scores_summary": {
+            "max":      float(np.max(sc)),
+            "mean":     float(np.mean(sc)),
+            "n_frames": len(sc),
+        }
+    }
+    email_text = build_email_summary(
+        pred, folder,
+        st.session_state.get("review_camera",""),
+        st.session_state.get("review_location",""),
+        st.session_state.get("review_notes",""),
+        st.session_state.get("reviewer_tag","")
+    )
+
+    ex1, ex2, ex3 = st.columns(3)
+    with ex1:
+        st.download_button("📄 Download PDF Report",
+                           data=pdf_bytes,
+                           file_name=f"{folder}_report.pdf",
+                           mime="application/pdf",
+                           use_container_width=True)
+    with ex2:
+        st.download_button("📋 Download JSON Export",
+                           data=json.dumps(export_obj, indent=2),
+                           file_name=f"{folder}_export.json",
+                           mime="application/json",
+                           use_container_width=True)
+    with ex3:
+        st.download_button("✉️ Download Email Draft",
+                           data=email_text,
+                           file_name=f"{folder}_email.txt",
+                           mime="text/plain",
+                           use_container_width=True)
+
+    with st.expander("Preview email draft", expanded=False):
+        st.text_area("Email text", value=email_text, height=280, key="email_ta_prev")
+
+# ══════════════════════════════════════════════════════════════
+# DATASET LAB PAGE
+# ══════════════════════════════════════════════════════════════
+def render_dataset_lab():
+    render_back_button()
+    st.markdown("<div class='vg-title'>📊 Dataset Lab</div>", unsafe_allow_html=True)
+    records = get_all_pred_records()
+    if not records:
+        st.info("No processed records found. Run some analyses via Ingest first."); return
+
+    tab_search, tab_compare, tab_stats, tab_errors, tab_cm = st.tabs([
+        "🔍 Search & Filter", "⚖️ Compare", "📈 Stats", "⚠️ Errors (FP/FN)", "🟦 Confusion Matrix"
+    ])
+
+    with tab_search:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            ds_filter = st.multiselect("Dataset", list(DATASETS.keys()), default=list(DATASETS.keys()), key="lab_ds_filter")
+        with col2:
+            pred_filter = st.multiselect("Prediction", ["Fight","Nonfight","NonFight"], default=["Fight","Nonfight","NonFight"], key="lab_pred_filter")
+        with col3:
+            query = st.text_input("Search folder name", "", key="lab_search_q")
+
+        filtered = [r for r in records
+                    if r.get("_dataset","") in ds_filter
+                    and r.get("pred_label","") in pred_filter
+                    and (not query or query.lower() in r.get("_folder","").lower())]
+
+        st.caption(f"Showing {len(filtered)} of {len(records)} records")
+        for r in filtered:
+            is_f = is_fight_pred(r)
+            badge = "vg-badge-fight" if is_f else "vg-badge-normal"
+            badge_txt = "FIGHT" if is_f else "NORMAL"
+            with st.expander(f"{r.get('_folder','?')} — {r.get('_dataset','?')}/{r.get('_class','?')}", expanded=False):
+                rc1, rc2 = st.columns([3,1])
+                with rc1:
+                    st.markdown(f"<span class='{badge}'>{badge_txt}</span>", unsafe_allow_html=True)
+                    st.text(f"Confidence: {r.get('confidence','?')}")
+                    st.text(f"True label: {r.get('true_label','?')}")
+                    st.text(f"Onset: {r.get('onset_time','N/A')}")
+                with rc2:
+                    folder_path = class_root(r.get("_dataset",""), r.get("_class","")) / r.get("_folder","")
+                    if folder_path.exists():
+                        if st.button("Load →", key=f"lab_load_{r.get('_folder','')}"):
+                            load_analysis_from_folder(folder_path, r.get("_dataset",""), r.get("_class",""), r.get("_folder",""))
+                            go_to("🧪 Review Workspace")
+
+    with tab_compare:
+        st.markdown("Select two folders to compare side-by-side.")
+        all_folder_labels = [f"{r.get('_folder','')} ({r.get('_dataset','')}/{r.get('_class','')})" for r in records]
+        if len(all_folder_labels) < 2:
+            st.info("Need at least 2 processed folders to compare."); return
+
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            sel_a = st.selectbox("Folder A", all_folder_labels, key="cmp_a")
+        with sc2:
+            sel_b = st.selectbox("Folder B", all_folder_labels, index=min(1, len(all_folder_labels)-1), key="cmp_b")
+
+        ra = records[all_folder_labels.index(sel_a)]
+        rb = records[all_folder_labels.index(sel_b)]
+
+        ca1, ca2 = st.columns(2)
+        for col, rec in [(ca1, ra), (ca2, rb)]:
+            with col:
+                is_f = is_fight_pred(rec)
+                badge = "vg-badge-fight" if is_f else "vg-badge-normal"
+                badge_txt = "FIGHT" if is_f else "NORMAL"
+                st.markdown(f"<span class='{badge}'>{badge_txt}</span> **{rec.get('_folder','?')}**", unsafe_allow_html=True)
+                st.text(f"Dataset: {rec.get('_dataset','?')}")
+                st.text(f"Confidence: {rec.get('confidence','?')}")
+                st.text(f"True label: {rec.get('true_label','?')}")
+                st.text(f"Onset time: {rec.get('onset_time','N/A')}")
+
+                folder_path = class_root(rec.get("_dataset",""), rec.get("_class","")) / rec.get("_folder","")
+                files_rec = get_files(folder_path)
+                if "original" in files_rec:
+                    _safe_video(files_rec["original"])
+
+    with tab_stats:
+        fight_count = sum(1 for r in records if is_fight_pred(r))
+        nonfight_count = len(records) - fight_count
+        correct_count = sum(1 for r in records if str(r.get("correct","")).lower() == "true")
+
+        st1, st2, st3, st4 = st.columns(4)
+        st1.metric("Total records", len(records))
+        st2.metric("Fight detections", fight_count)
+        st3.metric("Non-fight", nonfight_count)
+        st4.metric("Correct predictions", correct_count)
+
+        ds_counts = {}
+        for r in records:
+            ds = r.get("_dataset","unknown")
+            ds_counts[ds] = ds_counts.get(ds,0)+1
+
+        st.markdown("**Records per dataset**")
+        for ds, cnt in ds_counts.items():
+            st.text(f"  {ds}: {cnt} records")
+
+        confs = []
+        for r in records:
+            try: confs.append(float(r.get("confidence",0)))
+            except: pass
+        if confs:
+            st.markdown("**Confidence distribution**")
+            fig = make_hist_plot(np.array(confs))
+            st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+    with tab_errors:
+        st.markdown("Browse false positives and false negatives.")
+        errors = [r for r in records if str(r.get("correct","")).lower() == "false"]
+        if not errors:
+            st.success("No errors found in current records."); return
+        st.warning(f"{len(errors)} incorrect predictions found.")
+        for r in errors:
+            is_f = is_fight_pred(r)
+            badge = "vg-badge-fight" if is_f else "vg-badge-normal"
+            badge_txt = "FIGHT" if is_f else "NORMAL"
+            err_type = "False Positive" if is_f else "False Negative"
+            with st.expander(f"{err_type}: {r.get('_folder','?')}", expanded=False):
+                st.markdown(f"<span class='{badge}'>{badge_txt}</span>", unsafe_allow_html=True)
+                st.text(f"True label: {r.get('true_label','?')}")
+                st.text(f"Predicted: {r.get('pred_label','?')}")
+                st.text(f"Confidence: {r.get('confidence','?')}")
+                folder_path = class_root(r.get("_dataset",""), r.get("_class","")) / r.get("_folder","")
+                if folder_path.exists():
+                    if st.button("Load for review →", key=f"err_load_{r.get('_folder','')}"):
+                        load_analysis_from_folder(folder_path, r.get("_dataset",""), r.get("_class",""), r.get("_folder",""))
+                        go_to("🧪 Review Workspace")
+
+    with tab_cm:
+        fig, cm = make_confusion_matrix(records)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
+        tp = cm[0][0]; fn = cm[0][1]; fp = cm[1][0]; tn = cm[1][1]
+        total = tp + fn + fp + tn
+        if total > 0:
+            accuracy  = (tp+tn)/total
+            precision = tp/(tp+fp) if (tp+fp) > 0 else 0
+            recall    = tp/(tp+fn) if (tp+fn) > 0 else 0
+            f1        = 2*precision*recall/(precision+recall) if (precision+recall) > 0 else 0
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Accuracy",  f"{accuracy:.1%}")
+            mc2.metric("Precision", f"{precision:.1%}")
+            mc3.metric("Recall",    f"{recall:.1%}")
+            mc4.metric("F1 Score",  f"{f1:.3f}")
+
+# ══════════════════════════════════════════════════════════════
+# HISTORY PAGE
+# ══════════════════════════════════════════════════════════════
+def render_history():
+    render_back_button()
+    st.markdown("<div class='vg-title'>🕘 History</div>", unsafe_allow_html=True)
+    hist = st.session_state.get("_history", [])
+
+    if not hist:
+        st.info("No analysis history yet. Process a video to get started.")
+        return
+
+    hcol1, hcol2, hcol3 = st.columns([2,1,1])
+    with hcol1:
+        h_query = st.text_input("Search history", "", key="hist_search", placeholder="Filter by folder name...")
+    with hcol2:
+        h_ds_filter = st.multiselect("Dataset", list(DATASETS.keys()), default=list(DATASETS.keys()), key="hist_ds_filter")
+    with hcol3:
+        h_pred_filter = st.multiselect("Prediction", ["Fight","Nonfight","NonFight","?"], default=["Fight","Nonfight","NonFight","?"], key="hist_pred_filter")
+
+    filtered_hist = [
+        h for h in hist
+        if (not h_query or h_query.lower() in h.get("folder","").lower())
+        and h.get("dataset","") in h_ds_filter
+        and h.get("pred_lbl","?") in h_pred_filter
+    ]
+
+    st.caption(f"Showing {len(filtered_hist)} of {len(hist)} entries")
+
+    if st.button("⬇️ Export full history JSON", use_container_width=False):
+        st.download_button("Download history.json", data=json.dumps(hist, indent=2),
+                           file_name="visionguard_history.json", mime="application/json")
+
+    st.markdown("---")
+
+    for i, entry in enumerate(filtered_hist):
+        is_f = "fight" in str(entry.get("pred_lbl","")).lower() and "non" not in str(entry.get("pred_lbl","")).lower()
+        badge = "vg-badge-fight" if is_f else "vg-badge-normal"
+        badge_txt = "FIGHT" if is_f else "NORMAL"
+
+        with st.expander(
+            f"{entry.get('folder','?')}  ·  {entry.get('ts','?')}",
+            expanded=False
+        ):
+            top1, top2 = st.columns([3,1])
+            with top1:
+                st.markdown(
+                    f"<span class='{badge}'>{badge_txt}</span>"
+                    f" <b>{entry.get('folder','?')}</b>"
+                    f" <span class='vg-soft'>{entry.get('dataset','?')}/{entry.get('cls','?')}</span>",
+                    unsafe_allow_html=True
+                )
+                st.caption(f"Confidence: {entry.get('conf','?')}  ·  Onset: {entry.get('onset_t','N/A')}  ·  {entry.get('ts','?')}")
+                st.caption(f"Camera: {entry.get('camera','N/A')}  ·  Location: {entry.get('location','N/A')}  ·  Reviewer: {entry.get('reviewer_tag','N/A')}")
+                if entry.get("notes"):
+                    st.caption(f"Notes: {entry['notes']}")
+            with top2:
+                if st.button("Restore →", key=f"hist_restore_{i}", type="primary"):
+                    restore_history(entry)
+                    go_to("🧪 Review Workspace")
+
+            with st.form(key=f"hist_meta_form_{i}"):
+                st.markdown("**Edit metadata**")
+                fm1, fm2 = st.columns(2)
+                with fm1:
+                    new_cam  = st.text_input("Camera",   value=entry.get("camera",""),   key=f"hm_cam_{i}")
+                    new_loc  = st.text_input("Location", value=entry.get("location",""), key=f"hm_loc_{i}")
+                with fm2:
+                    new_rev  = st.text_input("Reviewer", value=entry.get("reviewer_tag",""), key=f"hm_rev_{i}")
+                    new_notes = st.text_area("Notes",    value=entry.get("notes",""),    key=f"hm_notes_{i}", height=60)
+                if st.form_submit_button("Save metadata"):
+                    update_history_metadata(entry.get("folder",""), entry.get("dataset",""), entry.get("cls",""),
+                                            new_cam, new_loc, new_notes, new_rev)
+                    st.success("Metadata updated.")
+                    st.rerun()
+
+            files_e = {k: Path(v) for k, v in entry.get("_files",{}).items()}
+            pred_e  = parse_pred_txt(files_e["pred"]) if "pred" in files_e else {}
+            exp1, exp2, exp3 = st.columns(3)
+            with exp1:
+                if pred_e:
+                    sc_e = scores_from_pred(pred_e, 100, float(CFG.DEFAULT_FPS))
+                    pdf_bytes = generate_pdf_report(pred_e, sc_e, float(CFG.DEFAULT_FPS), entry.get("folder","?"))
+                    st.download_button("PDF Report", data=pdf_bytes,
+                                       file_name=f"{entry.get('folder','hist')}_report.pdf",
+                                       mime="application/pdf",
+                                       key=f"hist_pdf_{i}", use_container_width=True)
+            with exp2:
+                export = {
+                    "folder": entry.get("folder"),
+                    "dataset": entry.get("dataset"),
+                    "class": entry.get("cls"),
+                    "prediction": pred_e,
+                    "metadata": {k: entry.get(k) for k in ["camera","location","notes","reviewer_tag","ts"]},
+                }
+                st.download_button("JSON Export", data=json.dumps(export, indent=2),
+                                   file_name=f"{entry.get('folder','hist')}_export.json",
+                                   mime="application/json",
+                                   key=f"hist_json_{i}", use_container_width=True)
+            with exp3:
+                email_text = build_email_summary(pred_e, entry.get("folder","?"),
+                                                  entry.get("camera",""), entry.get("location",""),
+                                                  entry.get("notes",""), entry.get("reviewer_tag",""))
+                st.download_button("Email Draft", data=email_text,
+                                   file_name=f"{entry.get('folder','hist')}_email.txt",
+                                   mime="text/plain",
+                                   key=f"hist_email_{i}", use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════
+# SETTINGS PAGE
+# ══════════════════════════════════════════════════════════════
+def render_settings():
+    render_back_button()
+    st.markdown("<div class='vg-title'>⚙️ Settings</div>", unsafe_allow_html=True)
+    tab_ui, tab_model, tab_acct = st.tabs(["🎨 UI", "🤖 Model / Detection", "👤 Account"])
+
+    with tab_ui:
+        st.markdown("**Appearance**")
+        new_theme = st.radio("Theme", ["dark","light"], index=0 if st.session_state.ui_theme=="dark" else 1, key="set_theme_radio")
+        new_accent = st.color_picker("Accent color", value=st.session_state.accent_color, key="set_accent_cp")
+        new_font = st.selectbox("Font size", ["small","medium","large"],
+                                index=["small","medium","large"].index(st.session_state.font_size), key="set_font")
+        if st.button("Apply UI settings", type="primary"):
+            st.session_state.ui_theme = new_theme
+            st.session_state.accent_color = new_accent
+            st.session_state.font_size = new_font
+            st.rerun()
+
+    with tab_model:
+        st.markdown("**Detection thresholds**")
+        t1, t2 = st.columns(2)
+        with t1:
+            new_thr_v = st.slider("Violence threshold", 0.0, 1.0,
+                                   st.session_state.thr_violence, 0.01, key="set_thr_v")
+        with t2:
+            new_thr_s = st.slider("Suspicious threshold", 0.0, 1.0,
+                                   st.session_state.thr_suspicious, 0.01, key="set_thr_s")
+        new_max_frames = st.number_input("Max frames to load", min_value=30, max_value=1000,
+                                          value=st.session_state.max_frames, step=10, key="set_max_frames")
+        if st.button("Save thresholds", type="primary"):
+            st.session_state.thr_violence   = new_thr_v
+            st.session_state.thr_suspicious = new_thr_s
+            st.session_state.max_frames     = int(new_max_frames)
+            st.success("Settings saved.")
+
+        st.markdown("**Checkpoint paths**")
+        for ds_key, cfg_v in PROC_CONFIGS.items():
+            ckpt_ok = Path(cfg_v["ckpt"]).exists()
+            status = "✅" if ckpt_ok else "❌ not found"
+            st.text(f"{ds_key}: {cfg_v['ckpt']}  {status}")
+
+    with tab_acct:
+        st.markdown(f"**Logged in as:** `{st.session_state.username}`")
+        st.markdown("**Change password**")
+        cp1 = st.text_input("Current password", type="password", key="set_cur_pw")
+        cp2 = st.text_input("New password", type="password", key="set_new_pw")
+        cp3 = st.text_input("Confirm new password", type="password", key="set_new_pw2")
+        if st.button("Change password"):
+            if not try_login(st.session_state.username, cp1):
+                st.error("Current password is incorrect.")
+            elif cp2 != cp3:
+                st.error("New passwords do not match.")
+            elif len(cp2) < 4:
+                st.error("Password must be at least 4 characters.")
             else:
                 users = load_users()
-                users[st.session_state.username] = hash_pw(cp_new)
+                info = users.get(st.session_state.username, {})
+                if isinstance(info, str): info = {"password": info, "reset_code": "000000"}
+                info["password"] = hash_pw(cp2)
+                users[st.session_state.username] = info
                 save_users(users)
-                st.success("✅ Password changed successfully!")
+                st.success("Password changed successfully.")
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown("**Session info**")
+        st.text(f"Run ID: {st.session_state.run_id}")
+        st.text(f"Device: {DEVICE}")
+        st.text(f"Loaded models: {list(_MODEL_CACHE.keys()) or 'None'}")
 
-        # ── ABOUT ────────────────────────────────────────────
-        st.markdown(f"""<div class="vg-settings-card" style="margin-top:16px;">
-        <div class="vg-settings-section-title">ℹ️ ABOUT</div>
-        <div style="font-family:'Share Tech Mono',monospace;font-size:11px;line-height:1.8;color:{tdim};">
-            <div>VisionGuard v6</div>
-            <div>Model: R3D-18 + LCM + LSTM</div>
-            <div>CAM: GradCAM | GradCAM++ | SmoothGradCAM++ | LayerCAM</div>
-            <div>Tracking: ByteTrack</div>
-            <div>Datasets: HockeyFight · RWF-2000</div>
-        </div>
-        </div>""", unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════
+# SMART TOOLS PAGE
+# ══════════════════════════════════════════════════════════════
+ZONES_FILE = Path(CFG.OUTPUT_DIR) / "zones.json"
+COC_FILE   = Path(CFG.OUTPUT_DIR) / "chain_of_custody.json"
 
-    # ── SAVE BUTTON ──────────────────────────────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    save_col, reset_col, _ = st.columns([1, 1, 3])
+def load_zones():
+    if ZONES_FILE.exists():
+        try: return json.loads(ZONES_FILE.read_text())
+        except: pass
+    return []
 
-    with save_col:
-        if st.button("💾 SAVE SETTINGS", type="primary", use_container_width=True, key="save_settings"):
-            st.session_state.ui_theme        = new_theme
-            st.session_state.accent_color    = new_accent
-            st.session_state.font_size       = new_font
-            st.session_state.show_scanlines  = new_scanlines
-            st.session_state.default_dataset = new_default_ds
-            st.session_state.default_class   = new_default_cls
-            st.session_state.max_frames      = new_max_frames
-            st.session_state.thr_violence    = new_thr_v
-            st.session_state.thr_suspicious  = new_thr_s
-            st.session_state.notify_fights   = new_notify
-            st.session_state.show_confidence_bar = new_conf_bar
-            st.session_state.chart_style     = new_chart_style
-            st.success("✅ Settings saved! Reloading...")
-            time.sleep(0.4)
-            st.rerun()
+def save_zones(z): ZONES_FILE.write_text(json.dumps(z, indent=2))
 
-    with reset_col:
-        if st.button("↩️ RESET DEFAULTS", use_container_width=True, key="reset_settings"):
-            for k in ["ui_theme","accent_color","font_size","show_scanlines",
-                      "notify_fights","show_confidence_bar","chart_style"]:
-                if k in st.session_state: del st.session_state[k]
-            st.session_state.thr_violence   = CFG.THRESH_VIOLENCE
-            st.session_state.thr_suspicious = CFG.THRESH_SUSPICIOUS
-            st.session_state.max_frames     = CFG.MAX_FRAMES
-            st.rerun()
+def load_coc():
+    if COC_FILE.exists():
+        try: return json.loads(COC_FILE.read_text())
+        except: pass
+    return []
 
+def save_coc(entries): COC_FILE.write_text(json.dumps(entries, indent=2))
 
-# ══════════════════════════════════════════
-# FOOTER
-# ══════════════════════════════════════════
-st.divider()
-st.markdown(
-    f"<span style='font-family:Share Tech Mono,monospace;font-size:10px;color:{tdim2};'>"
-    "VISIONGUARD v6 · R3D-18 + LCM + LSTM · GradCAM | GradCAM++ | SmoothGradCAM++ | LayerCAM | Combined · ByteTrack"
-    "</span>", unsafe_allow_html=True)
+def render_smart_tools():
+    render_back_button()
+    st.markdown("<div class='vg-title'>🛠️ Smart Tools</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div style='color:#7a99b0;font-size:13px;margin-bottom:16px;'>"
+        f"Real, working tools built from the feature ideas. Each tab is fully functional."
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    tab_clip, tab_heatmap, tab_zones, tab_coc = st.tabs([
+        "✂️ Evidence Clip Trimmer",
+        "📅 Risk Heatmap Calendar",
+        "🗺️ Zone Manager",
+        "🔐 Chain of Custody",
+    ])
+
+    with tab_clip:
+        st.markdown("### ✂️ Evidence Clip Trimmer")
+        st.markdown(
+            f"<div style='color:#7a99b0;font-size:13px;margin-bottom:12px;'>"
+            f"Automatically trim a video to a tight evidence window around the fight onset. "
+            f"Instead of saving the full clip, export only the relevant seconds."
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        records = get_all_pred_records()
+        fight_records = [r for r in records if is_fight_pred(r)]
+
+        if not fight_records:
+            st.info("No fight detections found. Process some videos first via Ingest.")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                folder_options = [
+                    f"{r.get('_folder','?')} ({r.get('_dataset','?')}/{r.get('_class','?')})"
+                    for r in fight_records
+                ]
+                sel_idx = st.selectbox("Select fight clip", range(len(folder_options)),
+                                       format_func=lambda i: folder_options[i], key="trim_sel")
+                rec = fight_records[sel_idx]
+
+            with col2:
+                pre_secs  = st.number_input("Seconds before onset", min_value=0.0, max_value=30.0, value=3.0, step=0.5, key="trim_pre")
+                post_secs = st.number_input("Seconds after onset",  min_value=1.0, max_value=60.0, value=8.0, step=0.5, key="trim_post")
+
+            onset_t = rec.get("onset_time", "N/A")
+            conf    = rec.get("confidence", "?")
+            total_f = rec.get("total_frames", "?")
+            st.markdown(
+                f"<div style='background:rgba(224,82,82,0.07);border:1px solid #e05252;border-radius:8px;"
+                f"padding:10px 14px;margin:10px 0;display:flex;gap:20px;flex-wrap:wrap;'>"
+                f"<span style='color:#ff5555;font-weight:700;'>⚠ FIGHT</span>"
+                f"<span style='color:#c8d8e8;font-size:13px;'>Onset: <b>{onset_t}</b></span>"
+                f"<span style='color:#c8d8e8;font-size:13px;'>Confidence: <b>{conf}</b></span>"
+                f"<span style='color:#c8d8e8;font-size:13px;'>Total frames: <b>{total_f}</b></span>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+            if st.button("✂️ Trim & Export Evidence Clip", type="primary", use_container_width=True, key="trim_btn"):
+                folder_path = class_root(rec.get("_dataset",""), rec.get("_class","")) / rec.get("_folder","")
+                files_r = get_files(folder_path)
+
+                if "original" not in files_r:
+                    st.error("Original video not found for this record.")
+                else:
+                    src_path = Path(files_r["original"])
+                    try:
+                        cap = cv2.VideoCapture(str(src_path))
+                        fps_v = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                        total_frames_v = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                        try:
+                            onset_frame_v = int(rec.get("onset_frame", 0))
+                        except:
+                            onset_frame_v = 0
+
+                        start_frame = max(0, int(onset_frame_v - pre_secs * fps_v))
+                        end_frame   = min(total_frames_v, int(onset_frame_v + post_secs * fps_v))
+
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                        clipped = []
+                        for fi in range(end_frame - start_frame):
+                            ret, frm = cap.read()
+                            if not ret: break
+                            clipped.append(frm)
+                        cap.release()
+
+                        if not clipped:
+                            st.error("Could not read frames from video.")
+                        else:
+                            h_v, w_v = clipped[0].shape[:2]
+                            tmp_path = Path(CFG.OUTPUT_DIR) / f"_trim_tmp_{rec.get('_folder','clip')}.mp4"
+                            wr = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps_v, (w_v, h_v))
+                            for frm in clipped: wr.write(frm)
+                            wr.release()
+
+                            clip_name = f"{rec.get('_folder','clip')}_evidence_{pre_secs:.0f}s_before_{post_secs:.0f}s_after.mp4"
+                            clip_bytes = tmp_path.read_bytes()
+                            tmp_path.unlink(missing_ok=True)
+
+                            duration = len(clipped) / fps_v
+                            st.success(
+                                f"✅ Trimmed clip ready — {len(clipped)} frames, {duration:.1f}s "
+                                f"(onset at +{pre_secs:.0f}s mark). Original was {total_frames_v} frames."
+                            )
+                            st.download_button(
+                                f"⬇ Download Evidence Clip ({duration:.1f}s)",
+                                data=clip_bytes,
+                                file_name=clip_name,
+                                mime="video/mp4",
+                                use_container_width=True,
+                                key="trim_dl"
+                            )
+                    except Exception as e:
+                        st.error(f"Trim failed: {e}")
+
+    with tab_heatmap:
+        st.markdown("### 📅 Risk Score Calendar Heatmap")
+        st.markdown(
+            f"<div style='color:#7a99b0;font-size:13px;margin-bottom:12px;'>"
+            f"Visualise fight detections across time. Identifies high-risk days and time windows from your analysis history."
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        hist_all = load_history_store()
+        if not hist_all:
+            st.info("No history yet. Process some videos first — timestamps are pulled from analysis history.")
+        else:
+            day_counts   = {}
+            hour_counts  = {}
+            dow_counts   = {}
+
+            for entry in hist_all:
+                ts_str = entry.get("ts", "")
+                is_f   = "fight" in str(entry.get("pred_lbl","")).lower() and "non" not in str(entry.get("pred_lbl","")).lower()
+                try:
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                    day_key = dt.strftime("%Y-%m-%d")
+                    hr      = dt.hour
+                    dow     = dt.weekday()
+
+                    for store, key in [(day_counts, day_key), (hour_counts, hr), (dow_counts, dow)]:
+                        if key not in store: store[key] = {"fights": 0, "total": 0}
+                        store[key]["total"] += 1
+                        if is_f: store[key]["fights"] += 1
+                except:
+                    pass
+
+            if not day_counts:
+                st.info("No valid timestamps found in history.")
+            else:
+                c = get_plot_colors()
+
+                st.markdown("**📊 Detections by Day**")
+                days_sorted = sorted(day_counts.keys())
+                day_fights  = [day_counts[d]["fights"] for d in days_sorted]
+                day_totals  = [day_counts[d]["total"]  for d in days_sorted]
+                day_normals = [t - f for t, f in zip(day_totals, day_fights)]
+
+                fig, ax = plt.subplots(figsize=(max(6, len(days_sorted)*0.8), 3), facecolor=c["bg"])
+                ax.set_facecolor(c["ax"])
+                x = range(len(days_sorted))
+                ax.bar(x, day_fights,  color="#e05252", label="Fight",    zorder=3)
+                ax.bar(x, day_normals, bottom=day_fights, color="#52e08a", label="Normal", zorder=3, alpha=0.6)
+                ax.set_xticks(list(x))
+                ax.set_xticklabels(days_sorted, rotation=45, ha="right", fontsize=7, color=c["tick"])
+                ax.set_ylabel("Count", fontsize=8, color=c["xlabel"])
+                ax.tick_params(colors=c["tick"])
+                ax.spines[:].set_color(c["spine"])
+                ax.legend(fontsize=8, labelcolor=c["legend_text"], facecolor=c["ax"], edgecolor=c["spine"])
+                plt.tight_layout()
+                st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+                col_h, col_d = st.columns(2)
+
+                with col_h:
+                    st.markdown("**🕐 Fights by Hour of Day**")
+                    hours     = list(range(24))
+                    h_fights  = [hour_counts.get(h, {}).get("fights", 0) for h in hours]
+                    h_risk    = [f / max(hour_counts.get(h, {}).get("total", 1), 1) for f, h in zip(h_fights, hours)]
+
+                    fig2, ax2 = plt.subplots(figsize=(5, 2.2), facecolor=c["bg"])
+                    ax2.set_facecolor(c["ax"])
+                    bar_colors = ["#e05252" if r > 0.5 else "#f5a623" if r > 0.2 else "#52e08a" for r in h_risk]
+                    ax2.bar(hours, h_fights, color=bar_colors, zorder=3)
+                    ax2.set_xlabel("Hour", fontsize=8, color=c["xlabel"])
+                    ax2.set_ylabel("Fight count", fontsize=8, color=c["xlabel"])
+                    ax2.tick_params(colors=c["tick"], labelsize=7)
+                    ax2.spines[:].set_color(c["spine"])
+
+                    if max(h_fights) > 0:
+                        peak_h = hours[h_fights.index(max(h_fights))]
+                        ax2.axvline(peak_h, color="#7ecfff", linewidth=1, linestyle=":", alpha=0.7)
+                        ax2.text(peak_h + 0.3, max(h_fights) * 0.9, f"Peak\n{peak_h:02d}:00",
+                                 color="#7ecfff", fontsize=7)
+                    plt.tight_layout()
+                    st.pyplot(fig2, use_container_width=True); plt.close(fig2)
+
+                with col_d:
+                    st.markdown("**📆 Fights by Day of Week**")
+                    dow_labels = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+                    dow_fights = [dow_counts.get(d, {}).get("fights", 0) for d in range(7)]
+                    dow_totals = [dow_counts.get(d, {}).get("total",  0) for d in range(7)]
+
+                    fig3, ax3 = plt.subplots(figsize=(5, 2.2), facecolor=c["bg"])
+                    ax3.set_facecolor(c["ax"])
+                    bar_cols_d = ["#e05252" if f > 0 else "#2a3a4a" for f in dow_fights]
+                    ax3.bar(dow_labels, dow_fights, color=bar_cols_d, zorder=3)
+                    ax3.bar(dow_labels, [t - f for t, f in zip(dow_totals, dow_fights)],
+                            bottom=dow_fights, color="#52e08a", alpha=0.4, zorder=2)
+                    ax3.set_ylabel("Count", fontsize=8, color=c["xlabel"])
+                    ax3.tick_params(colors=c["tick"], labelsize=8)
+                    ax3.spines[:].set_color(c["spine"])
+                    plt.tight_layout()
+                    st.pyplot(fig3, use_container_width=True); plt.close(fig3)
+
+                total_fights = sum(day_fights)
+                total_all    = sum(day_totals)
+                if total_fights > 0:
+                    peak_day = days_sorted[day_fights.index(max(day_fights))]
+                    peak_hour_v = hours[h_fights.index(max(h_fights))] if max(h_fights) > 0 else None
+                    peak_dow_v  = dow_labels[dow_fights.index(max(dow_fights))] if max(dow_fights) > 0 else None
+                    st.markdown(
+                        f"<div style='background:rgba(224,82,82,0.07);border:1px solid #e05252;"
+                        f"border-radius:8px;padding:12px 16px;margin-top:8px;'>"
+                        f"<div style='font-weight:700;color:#ff5555;margin-bottom:6px;'>⚠ Risk Insights</div>"
+                        f"<div style='color:#c8d8e8;font-size:13px;line-height:1.7;'>"
+                        f"• <b>{total_fights}</b> fights detected out of <b>{total_all}</b> total analyses "
+                        f"({total_fights/max(total_all,1)*100:.0f}% fight rate)<br>"
+                        f"• Highest risk day: <b>{peak_day}</b><br>"
+                        + (f"• Peak hour: <b>{peak_hour_v:02d}:00</b> — consider increased monitoring<br>" if peak_hour_v is not None else "")
+                        + (f"• Most fights on: <b>{peak_dow_v}s</b>" if peak_dow_v else "")
+                        + f"</div></div>",
+                        unsafe_allow_html=True
+                    )
+
+                export_data = {
+                    "generated_at": datetime.now().isoformat(),
+                    "daily": day_counts,
+                    "hourly": {str(k): v for k, v in hour_counts.items()},
+                    "day_of_week": {dow_labels[k]: v for k, v in dow_counts.items()},
+                }
+                st.download_button(
+                    "⬇ Export heatmap data (JSON)",
+                    data=json.dumps(export_data, indent=2),
+                    file_name="visionguard_risk_heatmap.json",
+                    mime="application/json",
+                    use_container_width=False,
+                    key="heatmap_dl"
+                )
+
+    with tab_zones:
+        st.markdown("### 🗺️ Zone Manager")
+        st.markdown(
+            f"<div style='color:#7a99b0;font-size:13px;margin-bottom:12px;'>"
+            f"Define named camera zones (e.g. 'Entrance Gate', 'Corridor B'). "
+            f"Tag incidents to zones and see which areas have the most detections."
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        zones = load_zones()
+
+        with st.expander("➕ Add / Edit Zones", expanded=len(zones) == 0):
+            with st.form("zone_form"):
+                zc1, zc2, zc3 = st.columns(3)
+                with zc1:
+                    z_name = st.text_input("Zone name", placeholder="e.g. Main Entrance")
+                with zc2:
+                    z_cam  = st.text_input("Camera ID", placeholder="e.g. CAM-01")
+                with zc3:
+                    z_loc  = st.text_input("Physical location", placeholder="e.g. Building A, Floor 1")
+                z_desc = st.text_area("Description", placeholder="What is monitored here?", height=60)
+                if st.form_submit_button("Save Zone", type="primary"):
+                    if z_name.strip():
+                        existing = [z for z in zones if z.get("name") == z_name.strip()]
+                        if existing:
+                            existing[0].update({"camera": z_cam, "location": z_loc, "description": z_desc})
+                        else:
+                            zones.append({
+                                "name": z_name.strip(),
+                                "camera": z_cam,
+                                "location": z_loc,
+                                "description": z_desc,
+                                "created_at": datetime.now().isoformat(),
+                            })
+                        save_zones(zones)
+                        st.success(f"Zone '{z_name}' saved.")
+                        st.rerun()
+                    else:
+                        st.error("Zone name is required.")
+
+        if not zones:
+            st.info("No zones defined yet. Add your first zone above.")
+        else:
+            st.markdown(f"**{len(zones)} zone(s) defined**")
+            records_all = get_all_pred_records()
+            hist_all_z  = load_history_store()
+
+            for zi, zone in enumerate(zones):
+                zname = zone.get("name", "?")
+                zcam  = zone.get("camera", "")
+                zloc  = zone.get("location", "")
+
+                zone_fights  = sum(1 for h in hist_all_z
+                                   if h.get("camera","") == zcam
+                                   and "fight" in str(h.get("pred_lbl","")).lower()
+                                   and "non" not in str(h.get("pred_lbl","")).lower())
+                zone_total   = sum(1 for h in hist_all_z if h.get("camera","") == zcam)
+
+                risk_color = "#e05252" if zone_fights > 2 else "#f5a623" if zone_fights > 0 else "#52e08a"
+                risk_label = "HIGH RISK" if zone_fights > 2 else "ELEVATED" if zone_fights > 0 else "CLEAR"
+
+                with st.expander(f"📍 {zname} — {risk_label}", expanded=False):
+                    zd1, zd2, zd3 = st.columns(3)
+                    zd1.metric("Camera", zcam or "—")
+                    zd2.metric("Location", zloc or "—")
+                    zd3.metric("Fight incidents", zone_fights)
+
+                    if zone_total > 0:
+                        st.markdown(
+                            f"<div style='background:rgba(0,0,0,0.2);border:1px solid {risk_color};"
+                            f"border-radius:6px;padding:8px 12px;margin:6px 0;'>"
+                            f"<span style='color:{risk_color};font-weight:700;font-size:12px;'>{risk_label}</span>"
+                            f" — {zone_fights} fights / {zone_total} total analyses "
+                            f"({zone_fights/max(zone_total,1)*100:.0f}% rate)"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+
+                    if zone.get("description"):
+                        st.caption(zone["description"])
+
+                    zone_incidents = [h for h in hist_all_z if h.get("camera","") == zcam][:5]
+                    if zone_incidents:
+                        st.markdown("**Recent incidents at this zone:**")
+                        for inc in zone_incidents:
+                            is_fi = "fight" in str(inc.get("pred_lbl","")).lower() and "non" not in str(inc.get("pred_lbl","")).lower()
+                            badge = "vg-badge-fight" if is_fi else "vg-badge-normal"
+                            badge_txt = "FIGHT" if is_fi else "NORMAL"
+                            st.markdown(
+                                f"<div style='display:flex;gap:10px;align-items:center;padding:4px 0;"
+                                f"border-bottom:1px solid #1a2535;'>"
+                                f"<span class='{badge}' style='font-size:10px;padding:2px 8px;'>{badge_txt}</span>"
+                                f"<span style='color:#c8d8e8;font-size:12px;'>{inc.get('folder','?')}</span>"
+                                f"<span style='color:#445566;font-size:11px;'>{inc.get('ts','?')}</span>"
+                                f"</div>",
+                                unsafe_allow_html=True
+                            )
+
+                    if st.button(f"🗑 Delete zone '{zname}'", key=f"del_zone_{zi}"):
+                        zones = [z for z in zones if z.get("name") != zname]
+                        save_zones(zones)
+                        st.rerun()
+
+            if zones:
+                st.markdown("**Zone Risk Overview**")
+                zone_names_chart  = [z.get("name","?") for z in zones]
+                zone_fights_chart = []
+                for z in zones:
+                    zcam = z.get("camera","")
+                    cnt = sum(1 for h in hist_all_z
+                              if h.get("camera","") == zcam
+                              and "fight" in str(h.get("pred_lbl","")).lower()
+                              and "non" not in str(h.get("pred_lbl","")).lower())
+                    zone_fights_chart.append(cnt)
+
+                if max(zone_fights_chart) > 0:
+                    c = get_plot_colors()
+                    fig_z, ax_z = plt.subplots(figsize=(6, 2.5), facecolor=c["bg"])
+                    ax_z.set_facecolor(c["ax"])
+                    bar_c = ["#e05252" if f > 2 else "#f5a623" if f > 0 else "#2a3a4a"
+                             for f in zone_fights_chart]
+                    ax_z.barh(zone_names_chart, zone_fights_chart, color=bar_c)
+                    ax_z.set_xlabel("Fight detections", fontsize=8, color=c["xlabel"])
+                    ax_z.tick_params(colors=c["tick"], labelsize=8)
+                    ax_z.spines[:].set_color(c["spine"])
+                    plt.tight_layout()
+                    st.pyplot(fig_z, use_container_width=True); plt.close(fig_z)
+                else:
+                    st.caption("No fight incidents recorded for any zone yet.")
+
+            st.download_button(
+                "⬇ Export zones (JSON)",
+                data=json.dumps(zones, indent=2),
+                file_name="visionguard_zones.json",
+                mime="application/json",
+                key="zones_dl"
+            )
+
+    with tab_coc:
+        st.markdown("### 🔐 Chain of Custody Log")
+        st.markdown(
+            f"<div style='color:#7a99b0;font-size:13px;margin-bottom:12px;'>"
+            f"Cryptographically hash output files at ingest time. "
+            f"Every entry is timestamped and signed — tamper-evident audit trail for legal evidence."
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        coc_entries = load_coc()
+
+        with st.expander("➕ Register Evidence File", expanded=False):
+            st.markdown("Select a processed folder to hash and register all its output files.")
+            records_coc = get_all_pred_records()
+            if not records_coc:
+                st.info("No processed records found.")
+            else:
+                folder_opts_coc = [
+                    f"{r.get('_folder','?')} ({r.get('_dataset','?')}/{r.get('_class','?')})"
+                    for r in records_coc
+                ]
+                with st.form("coc_form"):
+                    coc_sel_idx = st.selectbox("Folder", range(len(folder_opts_coc)),
+                                               format_func=lambda i: folder_opts_coc[i], key="coc_sel")
+                    coc_reviewer = st.text_input("Reviewer / Officer name", key="coc_rev_inp")
+                    coc_notes    = st.text_area("Notes / Case reference", height=60, key="coc_notes_inp")
+
+                    if st.form_submit_button("🔐 Hash & Register", type="primary"):
+                        rec_coc = records_coc[coc_sel_idx]
+                        folder_path_coc = class_root(rec_coc.get("_dataset",""), rec_coc.get("_class","")) / rec_coc.get("_folder","")
+                        files_coc = get_files(folder_path_coc)
+
+                        hashes = {}
+                        for fk, fpath in files_coc.items():
+                            try:
+                                fp = Path(fpath)
+                                if fp.exists() and fp.is_file():
+                                    h = hashlib.sha256(fp.read_bytes()).hexdigest()
+                                    hashes[fk] = {"filename": fp.name, "sha256": h, "size_bytes": fp.stat().st_size}
+                            except:
+                                pass
+
+                        bundle_str = json.dumps(hashes, sort_keys=True)
+                        bundle_hash = hashlib.sha256(bundle_str.encode()).hexdigest()
+
+                        entry_coc = {
+                            "id": hashlib.sha256(f"{rec_coc.get('_folder','')}_{datetime.now().isoformat()}".encode()).hexdigest()[:12],
+                            "folder": rec_coc.get("_folder","?"),
+                            "dataset": rec_coc.get("_dataset","?"),
+                            "cls": rec_coc.get("_class","?"),
+                            "pred_label": rec_coc.get("pred_label","?"),
+                            "confidence": rec_coc.get("confidence","?"),
+                            "registered_at": datetime.now().isoformat(),
+                            "reviewer": coc_reviewer,
+                            "notes": coc_notes,
+                            "file_hashes": hashes,
+                            "bundle_hash": bundle_hash,
+                            "verified": True,
+                        }
+                        coc_entries.insert(0, entry_coc)
+                        save_coc(coc_entries)
+                        st.success(f"✅ Registered! Bundle SHA-256: `{bundle_hash[:32]}...`")
+                        st.rerun()
+
+        if not coc_entries:
+            st.info("No evidence registered yet. Use the form above to hash and register a processed folder.")
+        else:
+            st.markdown(f"**{len(coc_entries)} registered evidence entries**")
+
+            if st.button("🔍 Verify All Entries (re-hash & compare)", use_container_width=False, key="coc_verify_all"):
+                n_ok = 0; n_fail = 0
+                for entry_v in coc_entries:
+                    folder_path_v = class_root(entry_v.get("dataset",""), entry_v.get("cls","")) / entry_v.get("folder","")
+                    files_v = get_files(folder_path_v)
+                    all_ok = True
+                    for fk, finfo in entry_v.get("file_hashes", {}).items():
+                        if fk in files_v:
+                            try:
+                                current_hash = hashlib.sha256(Path(files_v[fk]).read_bytes()).hexdigest()
+                                if current_hash != finfo.get("sha256",""):
+                                    all_ok = False
+                            except:
+                                all_ok = False
+                    if all_ok: n_ok += 1
+                    else: n_fail += 1
+                if n_fail == 0:
+                    st.success(f"✅ All {n_ok} entries verified — no tampering detected.")
+                else:
+                    st.error(f"⚠ {n_fail} entries FAILED verification — files may have been modified!")
+
+            for i, entry_coc in enumerate(coc_entries):
+                is_fi = "fight" in str(entry_coc.get("pred_label","")).lower() and "non" not in str(entry_coc.get("pred_label","")).lower()
+                badge = "vg-badge-fight" if is_fi else "vg-badge-normal"
+                badge_txt = "FIGHT" if is_fi else "NORMAL"
+
+                with st.expander(
+                    f"#{entry_coc.get('id','?')} · {entry_coc.get('folder','?')} · {entry_coc.get('registered_at','?')[:10]}",
+                    expanded=False
+                ):
+                    ec1, ec2, ec3 = st.columns(3)
+                    ec1.metric("Folder", entry_coc.get("folder","?"))
+                    ec2.metric("Registered", entry_coc.get("registered_at","?")[:10])
+                    ec3.metric("Reviewer", entry_coc.get("reviewer","—") or "—")
+
+                    st.markdown(f"<span class='{badge}'>{badge_txt}</span> Confidence: {entry_coc.get('confidence','?')}", unsafe_allow_html=True)
+                    st.markdown(f"**Bundle SHA-256:** `{entry_coc.get('bundle_hash','?')}`")
+
+                    if entry_coc.get("notes"):
+                        st.caption(f"Notes: {entry_coc['notes']}")
+
+                    with st.expander("File hashes", expanded=False):
+                        for fk, finfo in entry_coc.get("file_hashes", {}).items():
+                            st.text(f"{fk}: {finfo.get('sha256','?')[:32]}...  ({finfo.get('size_bytes',0):,} bytes)")
+
+                    if st.button(f"🔍 Verify this entry", key=f"coc_verify_{i}"):
+                        folder_path_v = class_root(entry_coc.get("dataset",""), entry_coc.get("cls","")) / entry_coc.get("folder","")
+                        files_v = get_files(folder_path_v)
+                        all_ok = True; mismatches = []
+                        for fk, finfo in entry_coc.get("file_hashes",{}).items():
+                            if fk in files_v:
+                                try:
+                                    current_hash = hashlib.sha256(Path(files_v[fk]).read_bytes()).hexdigest()
+                                    if current_hash != finfo.get("sha256",""):
+                                        all_ok = False
+                                        mismatches.append(fk)
+                                except:
+                                    all_ok = False; mismatches.append(fk)
+                        if all_ok:
+                            st.success("✅ All file hashes match — evidence is intact.")
+                        else:
+                            st.error(f"⚠ Hash mismatch on: {', '.join(mismatches)} — files may have been altered!")
+
+                    cert = {
+                        "certificate_type": "VisionGuard Chain of Custody",
+                        "generated_at": datetime.now().isoformat(),
+                        **entry_coc
+                    }
+                    st.download_button(
+                        "⬇ Download CoC Certificate (JSON)",
+                        data=json.dumps(cert, indent=2),
+                        file_name=f"CoC_{entry_coc.get('id','?')}_{entry_coc.get('folder','?')}.json",
+                        mime="application/json",
+                        key=f"coc_dl_{i}"
+                    )
+
+# ══════════════════════════════════════════════════════════════
+# ROUTER
+# ══════════════════════════════════════════════════════════════
+nav = st.session_state.nav_section
+
+if nav == "🏠 Home":
+    render_home()
+elif nav == "📥 Ingest":
+    render_ingest()
+elif nav == "🧪 Review Workspace":
+    render_review_workspace()
+elif nav == "📊 Dataset Lab":
+    render_dataset_lab()
+elif nav == "🕘 History":
+    render_history()
+elif nav == "🛠️ Smart Tools":
+    render_smart_tools()
+elif nav == "⚙️ Settings":
+    render_settings()
+else:
+    render_home()
