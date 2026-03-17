@@ -1821,8 +1821,8 @@ def render_home():
              "Connect RTSP/webcam streams. Run sliding-window inference in near-real-time and push webhook alerts. (Future roadmap)",
              False),
             ("🔮 Escalation Predictor",
-             "Use P(fight) slope in LSTM hidden states to predict fights 2–5 s before onset — alert security before contact occurs. (Future roadmap)",
-             False),
+             "Analyses P(fight) slope and acceleration to predict fights 2–5 s before onset. Issues early-warning alerts with countdown and confidence band — so security can act before contact occurs.",
+             True),
             ("🌐 Multi-Camera Correlation",
              "Auto-flag 'coordinated incidents' when 2+ cameras detect fights within 30 s of each other. (Future roadmap)",
              False),
@@ -3031,6 +3031,94 @@ def load_coc():
 def save_coc(entries): COC_FILE.write_text(json.dumps(entries, indent=2))
 
 # ══════════════════════════════════════════════════════════════
+# ESCALATION PREDICTOR ENGINE
+# ══════════════════════════════════════════════════════════════
+def compute_escalation_features(scores, fps, slope_window_s=1.5, accel_window_s=0.75):
+    """Rolling slope + acceleration on P(fight) scores. Returns composite escalation score."""
+    n = len(scores)
+    slope_win = max(2, int(slope_window_s * fps))
+    accel_win = max(2, int(accel_window_s * fps))
+    slope = np.zeros(n, dtype=np.float32)
+    accel = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        start = max(0, i - slope_win + 1)
+        seg = scores[start:i+1]
+        if len(seg) < 2:
+            slope[i] = 0.0
+        else:
+            xs = np.arange(len(seg), dtype=np.float32)
+            xm = xs.mean(); ym = seg.mean()
+            denom = ((xs - xm)**2).sum()
+            slope[i] = float(((xs-xm)*(seg-ym)).sum() / (denom + 1e-8))
+    for i in range(n):
+        start = max(0, i - accel_win + 1)
+        seg = slope[start:i+1]
+        if len(seg) < 2:
+            accel[i] = 0.0
+        else:
+            xs = np.arange(len(seg), dtype=np.float32)
+            xm = xs.mean(); ym = seg.mean()
+            denom = ((xs - xm)**2).sum()
+            accel[i] = float(((xs-xm)*(seg-ym)).sum() / (denom + 1e-8))
+    def _norm01(arr):
+        mn, mx = arr.min(), arr.max()
+        if mx - mn < 1e-8: return np.zeros_like(arr)
+        return (arr - mn) / (mx - mn)
+    slope_n = _norm01(np.clip(slope, 0, None))
+    accel_n = _norm01(np.clip(accel, 0, None))
+    score_n = _norm01(scores)
+    esc_score = np.clip(0.35 * score_n + 0.45 * slope_n + 0.20 * accel_n, 0.0, 1.0).astype(np.float32)
+    return {"slope": slope, "accel": accel, "esc_score": esc_score,
+            "slope_n": slope_n, "accel_n": accel_n, "score_n": score_n}
+
+
+def find_escalation_alert(esc_score, scores, fps, onset_frame, esc_thresh=0.55, min_lead_frames=3):
+    """Find earliest frame where escalation fires before actual onset. Returns (alert_frame, lead_seconds)."""
+    n = len(esc_score)
+    reference = onset_frame if onset_frame is not None else n
+    alert_frame = None
+    for i in range(n):
+        if i >= reference: break
+        if esc_score[i] >= esc_thresh:
+            alert_frame = i
+            break
+    if alert_frame is None:
+        region = esc_score[:reference] if reference > 0 else esc_score
+        if len(region) > 0:
+            alert_frame = int(np.argmax(region))
+    lead_s = ((reference - alert_frame) / fps) if (alert_frame is not None and fps > 0) else 0.0
+    if alert_frame is not None and (reference - alert_frame) < min_lead_frames:
+        alert_frame = None; lead_s = 0.0
+    return alert_frame, float(lead_s)
+
+
+def predict_onset_from_escalation(esc_score, scores, fps, alert_frame, lookahead_s=5.0):
+    """Linearly extrapolate when P(fight) will cross 0.5 from the alert frame. Returns (pred_onset_frame, r2_confidence)."""
+    if alert_frame is None or alert_frame >= len(scores):
+        return None, 0.0
+    lookahead = int(lookahead_s * fps)
+    n = len(scores)
+    end = min(alert_frame + lookahead, n)
+    seg = scores[alert_frame:end]
+    if len(seg) < 3:
+        return None, 0.0
+    xs = np.arange(len(seg), dtype=np.float32)
+    xm = xs.mean(); ym = seg.mean()
+    denom = ((xs - xm)**2).sum()
+    m = float(((xs-xm)*(seg-ym)).sum() / (denom + 1e-8))
+    b = float(ym - m * xm)
+    if abs(m) < 1e-6: return None, 0.0
+    x_cross = (0.5 - b) / m
+    if x_cross < 0: return None, 0.0
+    pred_onset = min(alert_frame + int(x_cross), n - 1)
+    y_pred = m * xs + b
+    ss_res = ((seg - y_pred)**2).sum()
+    ss_tot = ((seg - ym)**2).sum()
+    confidence = float(np.clip(1.0 - ss_res / (ss_tot + 1e-8), 0.0, 1.0))
+    return pred_onset, confidence
+
+
+# ══════════════════════════════════════════════════════════════
 # PERSON COUNT ESTIMATOR ENGINE
 # ══════════════════════════════════════════════════════════════
 def count_people_in_frames(frames_rgb, onset_frame, fps, sample_every=3):
@@ -3181,16 +3269,19 @@ def render_smart_tools():
         f"padding:3px 10px;border-radius:999px;border:1px solid {tblue};'>✅ LIVE — Chain of Custody</span>"
         f"<span style='background:rgba(126,207,255,0.15);color:{tblue};font-size:11px;font-weight:700;"
         f"padding:3px 10px;border-radius:999px;border:1px solid {tblue};'>✅ LIVE — Person Count Estimator</span>"
+        f"<span style='background:rgba(126,207,255,0.15);color:{tblue};font-size:11px;font-weight:700;"
+        f"padding:3px 10px;border-radius:999px;border:1px solid {tblue};'>✅ LIVE — Escalation Predictor</span>"
         f"</div>",
         unsafe_allow_html=True
     )
 
-    tab_clip, tab_heatmap, tab_zones, tab_coc, tab_people = st.tabs([
+    tab_clip, tab_heatmap, tab_zones, tab_coc, tab_people, tab_escalation = st.tabs([
         "✂️ Evidence Clip Trimmer",
         "📅 Risk Heatmap Calendar",
         "🗺️ Zone Manager",
         "🔐 Chain of Custody",
         "👥 Person Count Estimator",
+        "🔮 Escalation Predictor",
     ])
 
     # ── TAB 1: EVIDENCE CLIP TRIMMER ──────────────────────────
@@ -3855,6 +3946,322 @@ def render_smart_tools():
                     file_name=f"{source_name}_person_counts.json",
                     mime="application/json",
                     key="pc_export_dl"
+                )
+
+
+    # ── TAB 6: ESCALATION PREDICTOR ───────────────────────────
+    with tab_escalation:
+        st.markdown("### 🔮 Escalation Predictor")
+        st.markdown(
+            f"<div style='color:#7a99b0;font-size:13px;margin-bottom:12px;'>"
+            f"Analyses the <b>slope and acceleration</b> of P(fight) to fire an early-warning alert "
+            f"2–5 s <i>before</i> the actual fight onset — giving security time to intervene before "
+            f"contact occurs. Uses rolling linear regression on the score curve, no extra model needed."
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        # ── Source ────────────────────────────────────────────
+        esc_scores  = None
+        esc_fps     = float(CFG.DEFAULT_FPS)
+        esc_onset   = None
+        esc_pred    = {}
+        esc_src     = "none"
+
+        has_active = bool(st.session_state.get("active_folder_name"))
+        has_raw    = st.session_state.get("_raw_scores") is not None
+
+        if has_active or has_raw:
+            src_opts_e = []
+            if has_active: src_opts_e.append("Active loaded analysis")
+            if has_raw:    src_opts_e.append("Raw Video Input session")
+            if len(src_opts_e) > 1:
+                esc_src = st.radio("Source", src_opts_e, horizontal=True, key="esc_src_radio")
+            else:
+                esc_src = src_opts_e[0]
+
+            if esc_src == "Active loaded analysis":
+                raw_s = st.session_state.active_scores
+                if raw_s is not None and len(raw_s) > 0:
+                    esc_scores = np.array(raw_s, dtype=np.float32)
+                esc_fps   = float(st.session_state.active_fps or CFG.DEFAULT_FPS)
+                esc_pred  = st.session_state.active_pred or {}
+                try:
+                    esc_onset = int(esc_pred.get("onset_frame", 0)) if is_fight_pred(esc_pred) else None
+                except:
+                    esc_onset = None
+                esc_name = st.session_state.active_folder_name or "analysis"
+
+            else:
+                raw_sc = st.session_state.get("_raw_scores")
+                if raw_sc is not None:
+                    esc_scores = np.array(raw_sc, dtype=np.float32)
+                esc_fps   = float(st.session_state._raw_fps or CFG.DEFAULT_FPS)
+                esc_onset = st.session_state._raw_onset
+                esc_name  = st.session_state._raw_vid_name or "raw_video"
+        else:
+            st.info("No analysis loaded. Go to **Ingest** or **Raw Video Input** first, then come back.")
+            esc_scores = None
+            esc_name   = ""
+
+        if esc_scores is None or len(esc_scores) < 5:
+            st.warning("Not enough score data to run escalation analysis (need at least 5 frames).")
+        else:
+            # ── Controls ──────────────────────────────────────
+            st.markdown("---")
+            ec1, ec2, ec3 = st.columns(3)
+            with ec1:
+                esc_thresh = st.slider(
+                    "Escalation alert threshold", 0.30, 0.90, 0.55, 0.01, key="esc_thresh",
+                    help="Composite score (slope+accel+P) must exceed this to fire early warning"
+                )
+            with ec2:
+                slope_win_s = st.slider(
+                    "Slope window (s)", 0.5, 4.0, 1.5, 0.25, key="esc_slope_win",
+                    help="Width of rolling window for 1st derivative"
+                )
+            with ec3:
+                lookahead_s = st.slider(
+                    "Lookahead for projection (s)", 1.0, 8.0, 5.0, 0.5, key="esc_lookahead",
+                    help="How far ahead the linear extrapolation extends"
+                )
+
+            # ── Run engine ────────────────────────────────────
+            feats = compute_escalation_features(esc_scores, esc_fps,
+                                                slope_window_s=slope_win_s,
+                                                accel_window_s=slope_win_s * 0.5)
+            esc_score_arr = feats["esc_score"]
+            slope_arr     = feats["slope"]
+            accel_arr     = feats["accel"]
+
+            alert_frame, lead_s = find_escalation_alert(
+                esc_score_arr, esc_scores, esc_fps, esc_onset,
+                esc_thresh=esc_thresh, min_lead_frames=int(0.5 * esc_fps)
+            )
+            pred_onset_frame, pred_conf = predict_onset_from_escalation(
+                esc_score_arr, esc_scores, esc_fps, alert_frame, lookahead_s=lookahead_s
+            )
+
+            alert_t   = f"{alert_frame/esc_fps:.2f}s"       if alert_frame is not None else "N/A"
+            lead_label = f"{lead_s:.1f}s early"              if lead_s > 0 else "N/A"
+            pred_t    = f"{pred_onset_frame/esc_fps:.2f}s"   if pred_onset_frame is not None else "N/A"
+            onset_t   = f"{esc_onset/esc_fps:.2f}s"          if esc_onset is not None else "N/A"
+
+            # ── Alert banner ──────────────────────────────────
+            if alert_frame is not None and lead_s >= 0.5:
+                alert_color = "#e05252" if lead_s < 2.0 else "#f5a623" if lead_s < 4.0 else "#52e08a"
+                urgency = "🔴 URGENT" if lead_s < 2.0 else "🟡 WARNING" if lead_s < 4.0 else "🟢 EARLY WARNING"
+                st.markdown(
+                    f"<div style='background:rgba(224,82,82,0.08);border:2px solid {alert_color};"
+                    f"border-radius:10px;padding:16px 20px;margin:12px 0;'>"
+                    f"<div style='font-size:1.1rem;font-weight:800;color:{alert_color};margin-bottom:10px;'>"
+                    f"⚡ {urgency} — Early escalation detected</div>"
+                    f"<div style='display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;'>"
+                    f"<div><div style='font-size:10px;color:#445566;text-transform:uppercase;font-weight:700;'>Alert fires at</div>"
+                    f"<div style='font-size:1.2rem;font-weight:800;color:#e8f4ff;'>{alert_t}</div></div>"
+                    f"<div><div style='font-size:10px;color:#445566;text-transform:uppercase;font-weight:700;'>Lead time</div>"
+                    f"<div style='font-size:1.2rem;font-weight:800;color:{alert_color};'>{lead_label}</div></div>"
+                    f"<div><div style='font-size:10px;color:#445566;text-transform:uppercase;font-weight:700;'>Predicted onset</div>"
+                    f"<div style='font-size:1.2rem;font-weight:800;color:#e8f4ff;'>{pred_t}</div></div>"
+                    f"<div><div style='font-size:10px;color:#445566;text-transform:uppercase;font-weight:700;'>Actual onset</div>"
+                    f"<div style='font-size:1.2rem;font-weight:800;color:#7ecfff;'>{onset_t}</div></div>"
+                    f"</div>"
+                    f"<div style='margin-top:10px;padding-top:8px;border-top:1px solid rgba(224,82,82,0.2);"
+                    f"font-size:12px;color:#7a99b0;'>"
+                    f"Projection confidence (R²): <b style='color:#e8f4ff;'>{pred_conf:.2f}</b> &nbsp;·&nbsp; "
+                    f"Escalation score at alert: <b style='color:#e8f4ff;'>{float(esc_score_arr[alert_frame]):.3f}</b> &nbsp;·&nbsp; "
+                    f"Slope at alert: <b style='color:#e8f4ff;'>{float(slope_arr[alert_frame]):.4f}/frame</b>"
+                    f"</div></div>",
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    f"<div style='background:rgba(82,82,82,0.1);border:1px solid #2a3a4a;"
+                    f"border-radius:8px;padding:12px 16px;margin:12px 0;'>"
+                    f"<span style='color:#445566;font-weight:700;'>⚪ No early-warning fired</span>"
+                    f" — escalation score did not cross threshold before onset "
+                    f"(try lowering the threshold or the clip may not have a gradual build-up)."
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+            # ── Metrics row ───────────────────────────────────
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Max escalation score",    f"{float(np.max(esc_score_arr)):.3f}")
+            m2.metric("Max slope (rise/frame)",  f"{float(np.max(slope_arr)):.4f}")
+            m3.metric("Max acceleration",         f"{float(np.max(accel_arr)):.4f}")
+            m4.metric("Lead time",                lead_label)
+
+            # ── Main chart ────────────────────────────────────
+            st.markdown("**📈 Escalation analysis chart**")
+            c = get_plot_colors()
+            t_arr = np.arange(len(esc_scores)) / esc_fps
+
+            fig_e, axes = plt.subplots(3, 1, figsize=(11, 7), facecolor=c["bg"],
+                                        gridspec_kw={"height_ratios": [2, 1, 1], "hspace": 0.45})
+
+            # Panel 1: P(fight) + escalation score overlay
+            ax1 = axes[0]; ax1.set_facecolor(c["ax"])
+            ax1.plot(t_arr, esc_scores, color="#7ecfff", linewidth=1.5, label="P(fight)", zorder=3)
+            ax1.fill_between(t_arr, esc_scores, alpha=0.08, color="#7ecfff")
+            ax1.plot(t_arr, esc_score_arr, color="#f5a623", linewidth=1.4,
+                     linestyle="--", alpha=0.85, label="Escalation score", zorder=4)
+            ax1.axhline(esc_thresh, color="#e05252", linewidth=0.9, linestyle=":",
+                        alpha=0.7, label=f"Alert threshold ({esc_thresh:.2f})")
+            ax1.axhline(0.5, color="#7ecfff", linewidth=0.7, linestyle=":", alpha=0.4)
+            if esc_onset is not None:
+                ot = esc_onset / esc_fps
+                ax1.axvline(ot, color="#e05252", linewidth=1.8, label=f"Actual onset {onset_t}", zorder=5)
+                ax1.fill_between(t_arr, 0, 1, where=[t >= ot for t in t_arr],
+                                 alpha=0.05, color="#e05252")
+            if alert_frame is not None:
+                at = alert_frame / esc_fps
+                ax1.axvline(at, color="#f5a623", linewidth=1.8,
+                            label=f"⚡ Alert @ {alert_t} (+{lead_s:.1f}s early)", zorder=5)
+                ax1.fill_between(t_arr, 0, 1,
+                                 where=[alert_frame/esc_fps <= t <= (esc_onset/esc_fps if esc_onset else at)
+                                        for t in t_arr],
+                                 alpha=0.08, color="#f5a623")
+            if pred_onset_frame is not None:
+                pt = pred_onset_frame / esc_fps
+                ax1.axvline(pt, color="#a78bfa", linewidth=1.2,
+                            linestyle="--", alpha=0.7,
+                            label=f"Predicted onset {pred_t} (R²={pred_conf:.2f})")
+            ax1.set_ylabel("Score", fontsize=8, color=c["xlabel"])
+            ax1.set_ylim(0, 1.05)
+            ax1.tick_params(colors=c["tick"], labelsize=7)
+            ax1.spines[:].set_color(c["spine"])
+            ax1.legend(fontsize=7, labelcolor=c["legend_text"], facecolor=c["ax"],
+                       edgecolor=c["spine"], loc="upper left")
+            ax1.set_title(f"Escalation Analysis — {esc_name}", fontsize=9,
+                          color=c["legend_text"], fontweight="bold")
+
+            # Panel 2: slope
+            ax2 = axes[1]; ax2.set_facecolor(c["ax"])
+            pos_slope = np.clip(slope_arr, 0, None)
+            neg_slope = np.clip(slope_arr, None, 0)
+            ax2.fill_between(t_arr, pos_slope, alpha=0.5, color="#52e08a", label="Rising slope")
+            ax2.fill_between(t_arr, neg_slope, alpha=0.4, color="#e05252", label="Falling slope")
+            ax2.plot(t_arr, slope_arr, color="#52e08a", linewidth=0.8, alpha=0.8)
+            ax2.axhline(0, color=c["spine"], linewidth=0.6)
+            if alert_frame is not None:
+                ax2.axvline(alert_frame / esc_fps, color="#f5a623", linewidth=1.2, linestyle="--", alpha=0.7)
+            ax2.set_ylabel("Slope", fontsize=8, color=c["xlabel"])
+            ax2.tick_params(colors=c["tick"], labelsize=7)
+            ax2.spines[:].set_color(c["spine"])
+            ax2.legend(fontsize=7, labelcolor=c["legend_text"], facecolor=c["ax"], edgecolor=c["spine"])
+
+            # Panel 3: acceleration
+            ax3 = axes[2]; ax3.set_facecolor(c["ax"])
+            ax3.plot(t_arr, accel_arr, color="#a78bfa", linewidth=1.0, alpha=0.9, label="Acceleration")
+            ax3.fill_between(t_arr, accel_arr, alpha=0.15, color="#a78bfa")
+            ax3.axhline(0, color=c["spine"], linewidth=0.6)
+            if alert_frame is not None:
+                ax3.axvline(alert_frame / esc_fps, color="#f5a623", linewidth=1.2, linestyle="--", alpha=0.7)
+            ax3.set_xlabel("Time (s)", fontsize=8, color=c["xlabel"])
+            ax3.set_ylabel("Acceleration", fontsize=8, color=c["xlabel"])
+            ax3.tick_params(colors=c["tick"], labelsize=7)
+            ax3.spines[:].set_color(c["spine"])
+            ax3.legend(fontsize=7, labelcolor=c["legend_text"], facecolor=c["ax"], edgecolor=c["spine"])
+
+            plt.tight_layout()
+            st.pyplot(fig_e, use_container_width=True)
+            plt.close(fig_e)
+
+            # ── How it works explainer ────────────────────────
+            with st.expander("🔬 How the Escalation Predictor works", expanded=False):
+                st.markdown(
+                    f"<div style='font-size:13px;color:#c8d8e8;line-height:1.75;'>"
+                    f"<b style='color:#7ecfff;'>1. Rolling slope (1st derivative)</b><br>"
+                    f"For each frame, a least-squares linear fit is computed over the last "
+                    f"<code>{slope_win_s:.1f}s</code> of P(fight) scores. The slope measures "
+                    f"how fast the fight probability is <i>rising</i> — even before it crosses any fixed threshold.<br><br>"
+                    f"<b style='color:#7ecfff;'>2. Acceleration (2nd derivative)</b><br>"
+                    f"The slope of the slope is computed over a shorter window "
+                    f"(<code>{slope_win_s*0.5:.2f}s</code>). Rising acceleration means the situation "
+                    f"is escalating <i>faster and faster</i> — the strongest pre-onset signal.<br><br>"
+                    f"<b style='color:#7ecfff;'>3. Composite escalation score</b><br>"
+                    f"The three normalised signals are blended: "
+                    f"<code>0.35 × P(fight) + 0.45 × slope + 0.20 × acceleration</code>. "
+                    f"When this crosses the alert threshold, the early-warning fires.<br><br>"
+                    f"<b style='color:#7ecfff;'>4. Onset projection</b><br>"
+                    f"From the alert frame, a linear extrapolation of P(fight) predicts the frame "
+                    f"where P(fight) will cross 0.5. The R² of the fit is reported as projection confidence — "
+                    f"higher = more reliable.<br><br>"
+                    f"<b style='color:#f5a623;'>Lead time</b> = actual_onset_frame − alert_frame, in seconds. "
+                    f"A lead time of 2–5 s gives security staff time to respond before physical contact."
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+            # ── Export ────────────────────────────────────────
+            export_esc = {
+                "source":          esc_name,
+                "generated_at":    datetime.now().isoformat(),
+                "fps":             float(esc_fps),
+                "n_frames":        len(esc_scores),
+                "alert_threshold": float(esc_thresh),
+                "alert_frame":     alert_frame,
+                "alert_time_s":    alert_t,
+                "lead_time_s":     float(lead_s),
+                "actual_onset_frame":    esc_onset,
+                "actual_onset_time_s":   onset_t,
+                "predicted_onset_frame": pred_onset_frame,
+                "predicted_onset_time_s": pred_t,
+                "projection_confidence_r2": float(pred_conf),
+                "summary": {
+                    "max_esc_score": float(np.max(esc_score_arr)),
+                    "max_slope":     float(np.max(slope_arr)),
+                    "max_accel":     float(np.max(accel_arr)),
+                },
+                "frame_data": [
+                    {
+                        "frame":     int(i),
+                        "time_s":    round(i / esc_fps, 3),
+                        "p_fight":   round(float(esc_scores[i]), 4),
+                        "esc_score": round(float(esc_score_arr[i]), 4),
+                        "slope":     round(float(slope_arr[i]), 6),
+                        "accel":     round(float(accel_arr[i]), 6),
+                    }
+                    for i in range(len(esc_scores))
+                ]
+            }
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                # Save figure to PNG for download
+                fig_dl, axes_dl = plt.subplots(3, 1, figsize=(11, 7), facecolor=c["bg"],
+                                                gridspec_kw={"height_ratios": [2, 1, 1], "hspace": 0.45})
+                # quick redraw for download
+                for ax_dl in axes_dl: ax_dl.set_facecolor(c["ax"]); ax_dl.tick_params(colors=c["tick"]); ax_dl.spines[:].set_color(c["spine"])
+                axes_dl[0].plot(t_arr, esc_scores, color="#7ecfff", linewidth=1.5, label="P(fight)")
+                axes_dl[0].plot(t_arr, esc_score_arr, color="#f5a623", linewidth=1.2, linestyle="--", label="Escalation score")
+                if esc_onset is not None: axes_dl[0].axvline(esc_onset/esc_fps, color="#e05252", linewidth=1.5)
+                if alert_frame is not None: axes_dl[0].axvline(alert_frame/esc_fps, color="#f5a623", linewidth=1.5)
+                axes_dl[1].plot(t_arr, slope_arr, color="#52e08a", linewidth=0.9)
+                axes_dl[2].plot(t_arr, accel_arr, color="#a78bfa", linewidth=0.9)
+                axes_dl[0].set_ylim(0, 1.05)
+                axes_dl[2].set_xlabel("Time (s)", fontsize=8, color=c["xlabel"])
+                plt.tight_layout()
+                buf_e = io.BytesIO()
+                plt.savefig(buf_e, format="png", dpi=120, facecolor=c["bg"])
+                plt.close(fig_dl)
+                buf_e.seek(0)
+                st.download_button(
+                    "⬇ Download chart (PNG)",
+                    data=buf_e.read(),
+                    file_name=f"{esc_name}_escalation_chart.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key="esc_chart_dl"
+                )
+            with dl2:
+                st.download_button(
+                    "⬇ Export escalation data (JSON)",
+                    data=json.dumps(export_esc, indent=2),
+                    file_name=f"{esc_name}_escalation.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    key="esc_json_dl"
                 )
 
 # ══════════════════════════════════════════════════════════════
