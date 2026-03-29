@@ -109,7 +109,7 @@ DATASETS = {
     "rwf":         ["Fight", "NonFight", "pred_nonfight"],
 }
 
-ALL_VID_KEYS  = ["original","gradcam","gradcampp","smooth_gradcampp","layercam","combined"]
+ALL_VID_KEYS  = ["original","gradcam","gradcampp","smooth_gradcampp","layercam","combined","bytetrack","combined_track"]
 VID_LABELS    = {
     "original":         "📹 Original",
     "gradcam":          "🔥 GradCAM",
@@ -117,9 +117,11 @@ VID_LABELS    = {
     "smooth_gradcampp": "✨ Smooth GradCAM++",
     "layercam":         "🌊 LayerCAM",
     "combined":         "🎯 Combined",
+    "bytetrack":        "📍 ByteTrack",
+    "combined_track":   "🎯+📍 Combined + ByteTrack",
 }
 ALL_GRID_KEYS = ["raw_grid","gradcam_grid","gradcampp_grid",
-                 "smooth_gradcampp_grid","layercam_grid","combined_grid"]
+                 "smooth_gradcampp_grid","layercam_grid","combined_grid","bytetrack_grid"]
 GRID_LABELS   = {
     "raw_grid":              "📷 Raw Frames",
     "gradcam_grid":          "🌡️ GradCAM",
@@ -127,12 +129,12 @@ GRID_LABELS   = {
     "smooth_gradcampp_grid": "✨ Smooth GradCAM++",
     "layercam_grid":         "🌊 LayerCAM",
     "combined_grid":         "🎯 Combined",
+    "bytetrack_grid":        "📍 ByteTrack",
 }
 
 MAIN_NAV = [
     "🏠 Home",
     "📥 Ingest",
-    "📹 Raw Video Input",
     "🧪 Review Workspace",
     "📊 Dataset Lab",
     "🕘 History",
@@ -174,6 +176,14 @@ class LSTMHead(nn.Module):
     def forward_all_steps(self, x):
         out, _ = self.lstm(x)
         return out
+    def forward_with_attention(self, x, fc):
+        all_h = self.lstm(x)[0]
+        d     = self.drop(all_h)
+        lin   = fc[-1] if isinstance(fc, nn.Sequential) else fc
+        sp    = torch.softmax(lin(d[0]), dim=-1)[:, 1]
+        aw    = torch.softmax(sp, dim=0)
+        lg    = fc(self.drop(all_h[:, -1, :]))
+        return lg, all_h, sp.detach().cpu().numpy(), aw.detach().cpu().numpy()
 
 
 class R3D18WithLCM_LSTM(nn.Module):
@@ -224,6 +234,12 @@ class R3D18WithLCM_LSTM(nn.Module):
         logits = self.fc(self.lstm_head.drop(all_h[:, -1, :]))
         return logits, seq_p
 
+    def forward_with_attention(self, x):
+        o2, o3, o4 = self._backbone(x)
+        seq = self._pool_seq(o4)
+        lg, _, sp, aw = self.lstm_head.forward_with_attention(seq, self.fc)
+        return lg, o2, o3, o4, sp, aw
+
 
 def _disable_inplace(model):
     for m in model.modules():
@@ -259,27 +275,38 @@ def load_model_cached(cfg: dict):
 # ══════════════════════════════════════════════════════════════
 class CAMEngine:
     def __init__(self, model):
-        self.model  = model
-        self._saved = {}
+        self.model = model; self._s = {}
         self._hooks = [
             model.layer2[-1].conv2.register_forward_hook(
-                lambda m, i, o: self._saved.update({"layer2": o})),
+                lambda m, i, o: self._s.update({"layer2": o})),
             model.layer3[-1].conv2.register_forward_hook(
-                lambda m, i, o: self._saved.update({"layer3": o})),
+                lambda m, i, o: self._s.update({"layer3": o})),
             model.layer4[-1].conv2.register_forward_hook(
-                lambda m, i, o: self._saved.update({"layer4": o})),
+                lambda m, i, o: self._s.update({"layer4": o})),
         ]
 
-    def _fwd_grad(self, x, cls, layers=("layer2","layer3","layer4")):
-        self.model.zero_grad(); self._saved.clear()
+    def _fwd_attn(self, x, cls, layers=("layer2","layer3","layer4")):
+        self.model.zero_grad(); self._s.clear()
         with torch.enable_grad():
-            score = self.model(x)[0, cls]
-            grads = torch.autograd.grad(score,
-                        [self._saved[l] for l in layers],
-                        retain_graph=False, create_graph=False)
-        acts  = {l: self._saved[l].detach()[0] for l in layers}
-        grads = {l: grads[i].detach()[0] for i, l in enumerate(layers)}
-        return acts, grads
+            lg, o2, o3, o4, sp, aw = self.model.forward_with_attention(x)
+            score = lg[0, cls]
+            grads = torch.autograd.grad(score, [self._s[l] for l in layers],
+                                        retain_graph=False, create_graph=False,
+                                        allow_unused=True)
+        acts = {l: self._s[l].detach()[0] for l in layers}
+        gd   = {l: (grads[i].detach()[0] if grads[i] is not None
+                    else torch.zeros_like(acts[l]))
+                for i, l in enumerate(layers)}
+        return acts, gd, sp, aw
+
+    def _fwd_simple(self, x, cls, layers=("layer4",)):
+        self.model.zero_grad(); self._s.clear()
+        with torch.enable_grad():
+            sc = self.model(x)[0, cls]
+            grads = torch.autograd.grad(sc, [self._s[l] for l in layers],
+                                        retain_graph=False, create_graph=False)
+        return ({l: self._s[l].detach()[0] for l in layers},
+                {l: grads[i].detach()[0] for i, l in enumerate(layers)})
 
     def _up_norm(self, cam, tgt):
         up = F.interpolate(cam.unsqueeze(0).unsqueeze(0).float(),
@@ -288,42 +315,60 @@ class CAMEngine:
         mn, mx = up.min(), up.max()
         return (up - mn) / (mx - mn + EPS)
 
+    def _temporal_attn(self, cam, aw):
+        T = cam.shape[0]
+        w = aw if len(aw) == T else np.interp(
+            np.linspace(0, 1, T), np.linspace(0, 1, len(aw)), aw)
+        s = cam * w[:, None, None]
+        mn, mx = s.min(), s.max()
+        return (s - mn) / (mx - mn + EPS)
+
     def compute_all(self, x, cls=1):
         T, H, W = x.shape[2], x.shape[3], x.shape[4]
         tgt = (T, H, W)
-        A, G = self._fwd_grad(x, cls)
+        A, G, sp, aw = self._fwd_attn(x, cls)
 
-        w  = G["layer4"].mean(dim=(1,2,3))
-        gc = self._up_norm(F.relu((w[:,None,None,None]*A["layer4"]).sum(0)), tgt)
+        # GradCAM — LSTM attention weighted
+        wg = G["layer4"].mean(dim=(1,2,3))
+        gc = self._up_norm(F.relu((wg[:,None,None,None]*A["layer4"]).sum(0)), tgt)
+        gc = self._temporal_attn(gc, aw)
 
+        # GradCAM++ — LSTM attention weighted
         G2 = G["layer4"]**2; G3 = G["layer4"]**3
         dn = 2.0*G2 + (A["layer4"]*G3).sum(dim=(1,2,3), keepdim=True)
         al = G2 / (dn + EPS)
         wt = (al * F.relu(G["layer4"])).sum(dim=(1,2,3))
         gcpp = self._up_norm(F.relu((wt[:,None,None,None]*A["layer4"]).sum(0)), tgt)
+        gcpp = self._temporal_attn(gcpp, aw)
 
-        lc = np.zeros((T,H,W), dtype=np.float32)
+        # LayerCAM — gradient-magnitude weighted fusion across L2+L3+L4
+        lcams, lnorms = [], []
         for ln in ["layer2","layer3","layer4"]:
-            lc += self._up_norm(F.relu(F.relu(G[ln])*A[ln]).sum(0), tgt)
-        lc /= 3.0
-        mn, mx = lc.min(), lc.max(); lc = (lc-mn)/(mx-mn+EPS)
+            lcams.append(self._up_norm(F.relu(F.relu(G[ln])*A[ln]).sum(0), tgt))
+            lnorms.append(float(torch.norm(G[ln], p="fro").cpu()) + EPS)
+        tn = sum(lnorms)
+        lc = sum(c * (n / tn) for c, n in zip(lcams, lnorms))
+        mn, mx = lc.min(), lc.max(); lc = (lc - mn) / (mx - mn + EPS)
+        lc = self._temporal_attn(lc, aw)
 
-        sm = np.zeros((T,H,W), dtype=np.float32); n_ok = 0
-        ns = SMOOTH_SIGMA * (x.max()-x.min()).item()
+        # SmoothGradCAM++ — adaptive sigma
+        fv = float(x.var().item())
+        ns = max(0.02, min(SMOOTH_SIGMA, SMOOTH_SIGMA / (1. + fv * 10.))) * (x.max() - x.min()).item()
+        sm = np.zeros((T, H, W), dtype=np.float32); n_ok = 0
         for _ in range(SMOOTH_N):
             try:
-                an, gn = self._fwd_grad((x+torch.randn_like(x)*ns).detach(),
-                                        cls, layers=("layer4",))
+                an, gn = self._fwd_simple((x + torch.randn_like(x) * ns).detach(), cls)
                 G2n = gn["layer4"]**2; G3n = gn["layer4"]**3
                 dn2 = 2.0*G2n + (an["layer4"]*G3n).sum(dim=(1,2,3), keepdim=True)
-                al2 = G2n/(dn2+EPS)
-                wt2 = (al2*F.relu(gn["layer4"])).sum(dim=(1,2,3))
+                al2 = G2n / (dn2 + EPS)
+                wt2 = (al2 * F.relu(gn["layer4"])).sum(dim=(1,2,3))
                 sm += self._up_norm(F.relu((wt2[:,None,None,None]*an["layer4"]).sum(0)), tgt)
                 n_ok += 1
             except Exception:
                 pass
         if n_ok > 0: sm /= n_ok
-        mn, mx = sm.min(), sm.max(); sm = (sm-mn)/(mx-mn+EPS)
+        mn, mx = sm.min(), sm.max(); sm = (sm - mn) / (mx - mn + EPS)
+        sm = self._temporal_attn(sm, aw)
 
         return {"gradcam": gc, "gradcampp": gcpp, "smooth_gradcampp": sm, "layercam": lc}
 
@@ -1413,7 +1458,20 @@ def push_history(folder_name, dataset, cls, pred, active_files_dict, camera="", 
     st.session_state["_history"] = hist[:50]
 
 def restore_history(entry: dict):
-    files = {k: Path(v) for k, v in entry.get("_files", {}).items()}
+    # Try to re-resolve files from disk first (handles moved/renamed folders)
+    ds  = entry.get("dataset", "")
+    cls = entry.get("cls", "")
+    folder_name = entry.get("folder", "")
+    folder_path = class_root(ds, cls) / folder_name if ds and cls and folder_name else None
+
+    if folder_path and folder_path.exists():
+        # Folder exists on disk — get fresh file paths
+        files = get_files(folder_path)
+    else:
+        # Fall back to stored paths, keep only ones that exist
+        files = {k: Path(v) for k, v in entry.get("_files", {}).items()
+                 if Path(v).exists()}
+
     pred_data = parse_pred_txt(files["pred"]) if "pred" in files else {}
     frames, fps2 = [], float(CFG.DEFAULT_FPS)
     if "original" in files:
@@ -1427,10 +1485,10 @@ def restore_history(entry: dict):
     st.session_state.active_scores = scores
     st.session_state.active_fps = fps2
     st.session_state.active_frames = frames
-    st.session_state.active_folder_name = entry["folder"]
+    st.session_state.active_folder_name = folder_name
     st.session_state.active_video_path = str(files.get("original", ""))
-    st.session_state.active_dataset = entry["dataset"]
-    st.session_state.active_class = entry["cls"]
+    st.session_state.active_dataset = ds
+    st.session_state.active_class = cls
     st.session_state["_active_files"] = {k: str(v) for k, v in files.items()}
     st.session_state["review_camera"] = entry.get("camera", "")
     st.session_state["review_location"] = entry.get("location", "")
@@ -1631,6 +1689,8 @@ def load_analysis_from_folder(folder_path: Path, ds: str, cls: str, folder_name:
     st.session_state.active_dataset = ds
     st.session_state.active_class = cls
     st.session_state["_active_files"] = {k: str(v) for k, v in files.items()}
+    st.session_state["_hide_active_card"] = False
+    st.session_state["_hide_last_processed"] = False
     push_history(folder_name, ds, cls, pred, st.session_state["_active_files"],
                  st.session_state.get("review_camera",""),
                  st.session_state.get("review_location",""),
@@ -1650,6 +1710,14 @@ def render_sidebar():
             f"</div>",
             unsafe_allow_html=True
         )
+
+        # ── Dark/light mode quick toggle ──
+        theme_now = st.session_state.get("ui_theme","dark")
+        theme_icon = "☀️ Light mode" if theme_now=="dark" else "🌙 Dark mode"
+        if st.button(theme_icon, use_container_width=True, key="sb_theme_toggle"):
+            st.session_state.ui_theme = "light" if theme_now=="dark" else "dark"
+            st.rerun()
+
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
         selected_nav = st.radio(
             "Navigation", MAIN_NAV,
@@ -1659,7 +1727,33 @@ def render_sidebar():
         if selected_nav != st.session_state.nav_section:
             go_to(selected_nav)
 
-        if st.session_state.active_folder_name:
+        # ── Last processed badge ──
+        hist_all = st.session_state.get("_history", [])
+        if hist_all and not st.session_state.get("_hide_last_processed"):
+            last = hist_all[0]
+            is_f_last = "fight" in str(last.get("pred_lbl","")).lower() and "non" not in str(last.get("pred_lbl","")).lower()
+            badge_last = '<span class="vg-badge-fight">⚠ FIGHT</span>' if is_f_last else '<span class="vg-badge-normal">✓ NORMAL</span>'
+            st.markdown(
+                f"<div class='vg-card' style='margin-top:6px;position:relative;'>"
+                f"<div style='font-size:10px;color:#445566;text-transform:uppercase;font-weight:700;margin-bottom:4px;'>Last processed</div>"
+                f"{badge_last}"
+                f"<div style='font-weight:700;margin-top:4px;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{last.get('folder','?')}</div>"
+                f"<div class='vg-mini'>{last.get('ts','')}</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+            if st.button("✕", key="dismiss_last", help="Dismiss"):
+                st.session_state["_hide_last_processed"] = True
+                st.rerun()
+        elif not hist_all and not st.session_state.active_folder_name:
+            st.markdown(
+                f"<div style='border:1px dashed #2a3a4a;border-radius:8px;padding:12px;text-align:center;"
+                f"color:#445566;font-size:.8rem;margin:8px 0;'>"
+                f"No analyses yet.<br>Go to <b>Ingest</b> to upload your first video.</div>",
+                unsafe_allow_html=True
+            )
+
+        if st.session_state.active_folder_name and not st.session_state.get("_hide_active_card"):
             pred_h = st.session_state.active_pred
             is_f = is_fight_pred(pred_h)
             badge = '<span class="vg-badge-fight">⚠ FIGHT</span>' if is_f else '<span class="vg-badge-normal">✓ NORMAL</span>'
@@ -1670,19 +1764,9 @@ def render_sidebar():
                 f"<div class='vg-soft'>Conf: {pred_h.get('confidence','?')}</div></div>",
                 unsafe_allow_html=True
             )
-
-        # Show raw video result if active
-        elif st.session_state.get("_raw_pred_lbl"):
-            pred_lbl = st.session_state._raw_pred_lbl
-            is_f = "fight" in str(pred_lbl).lower() and "non" not in str(pred_lbl).lower()
-            badge = '<span class="vg-badge-fight">⚠ FIGHT</span>' if is_f else '<span class="vg-badge-normal">✓ NORMAL</span>'
-            st.markdown(
-                f"<div class='vg-card'>{badge}"
-                f"<div style='margin-top:8px;font-weight:700'>{st.session_state._raw_vid_name}</div>"
-                f"<div class='vg-mini vg-badge-proxy' style='display:inline-block;margin-top:4px;'>Motion Energy Proxy</div>"
-                f"<div class='vg-soft'>Conf: {st.session_state._raw_conf:.3f}</div></div>",
-                unsafe_allow_html=True
-            )
+            if st.button("✕", key="dismiss_active", help="Dismiss"):
+                st.session_state["_hide_active_card"] = True
+                st.rerun()
 
         with st.expander(f"Recent ({len(st.session_state.get('_history', []))})", expanded=False):
             hist = st.session_state.get("_history", [])[:8]
@@ -1696,6 +1780,14 @@ def render_sidebar():
                         go_to("🧪 Review Workspace")
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+        # ── Keyboard shortcuts hint ──
+        st.markdown(
+            f"<div style='font-size:10px;color:#2a3a4a;text-align:center;margin-bottom:6px;'>"
+            f"⌨ Press <b>I</b>=Ingest · <b>R</b>=Review · <b>H</b>=History</div>",
+            unsafe_allow_html=True
+        )
+
         if st.button("Logout", use_container_width=True):
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
@@ -1703,8 +1795,23 @@ def render_sidebar():
 
 render_sidebar()
 
-# ══════════════════════════════════════════════════════════════
-# ACTIVE SUMMARY BAR
+# ── Keyboard shortcuts (I=Ingest, R=Review, H=History) ─────────
+_kb = st.query_params.get("kb", "")
+st.markdown("""
+<script>
+window.addEventListener('load', function() {
+    document.addEventListener('keydown', function(e) {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+        const map = {'i':'📥 Ingest','r':'🧪 Review Workspace','h':'🕘 History'};
+        const key = e.key.toLowerCase();
+        if (map[key]) {
+            const radios = window.parent.document.querySelectorAll('[data-testid="stRadio"] label');
+            radios.forEach(label => { if (label.innerText.trim().startsWith(map[key].slice(0,3))) label.click(); });
+        }
+    });
+});
+</script>
+""", unsafe_allow_html=True)
 # ══════════════════════════════════════════════════════════════
 def render_active_summary_bar():
     pred = st.session_state.active_pred
@@ -1754,52 +1861,24 @@ def render_home():
     h5.metric("Device", str(DEVICE))
 
     st.markdown("### Quick Launch")
-    q1, q2, q3, q4, q5, q6 = st.columns(6)
+    q1, q2, q3, q4, q5 = st.columns(5)
     with q1:
-        if st.button("📹 Raw Video Input", use_container_width=True, type="primary"):
-            go_to("📹 Raw Video Input")
-    with q2:
-        if st.button("📥 Ingest Video", use_container_width=True):
+        if st.button("📥 Ingest Video", use_container_width=True, type="primary"):
             go_to("📥 Ingest")
-    with q3:
+    with q2:
         if st.button("🧪 Review Workspace", use_container_width=True):
             go_to("🧪 Review Workspace")
-    with q4:
+    with q3:
         if st.button("📊 Dataset Lab", use_container_width=True):
             go_to("📊 Dataset Lab")
-    with q5:
+    with q4:
         if st.button("🕘 History", use_container_width=True):
             go_to("🕘 History")
-    with q6:
+    with q5:
         if st.button("🛠️ Smart Tools", use_container_width=True):
             go_to("🛠️ Smart Tools")
 
-    # New feature callouts
-    st.markdown(
-        f"<div style='background:linear-gradient(135deg,rgba(126,207,255,0.06) 0%,rgba(224,82,82,0.06) 100%);"
-        f"border:1px solid {bord};border-radius:12px;padding:16px 20px;margin:12px 0;'>"
-        f"<div style='font-weight:800;color:{tblue};font-size:1rem;margin-bottom:10px;'>✨ What's in v10</div>"
-        f"<div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;'>"
-        f"<div style='background:rgba(0,0,0,0.2);border-radius:8px;padding:10px 14px;'>"
-        f"<div style='font-weight:700;color:#e8f4ff;margin-bottom:4px;'>📹 Raw Video Input</div>"
-        f"<div style='color:#7a99b0;font-size:12px;'>Upload any video — no checkpoint needed. "
-        f"Motion-energy proxy scores P(fight) frame-by-frame with onset detection and face detection.</div>"
-        f"</div>"
-        f"<div style='background:rgba(0,0,0,0.2);border-radius:8px;padding:10px 14px;'>"
-        f"<div style='font-weight:700;color:#e8f4ff;margin-bottom:4px;'>👤 Fight Face Detector</div>"
-        f"<div style='color:#7a99b0;font-size:12px;'>Click <b>👤 SHOW FACES</b> on any video to extract fighter crops "
-        f"using a 4-method cascade: frontal → profile → upper body → motion ROI fallback.</div>"
-        f"</div>"
-        f"<div style='background:rgba(0,0,0,0.2);border-radius:8px;padding:10px 14px;'>"
-        f"<div style='font-weight:700;color:#e8f4ff;margin-bottom:4px;'>🤖 Flexible Model Picker</div>"
-        f"<div style='color:#7a99b0;font-size:12px;'>Choose your model at ingest time. Missing checkpoints are "
-        f"detected automatically — only available models appear in the selector.</div>"
-        f"</div>"
-        f"</div></div>",
-        unsafe_allow_html=True
-    )
-
-    # Smart Tools preview card (from v8)
+    # Smart Tools preview card
     with st.expander("🛠️ Smart Tools — click any to open", expanded=False):
         ideas = [
             ("✂️ Evidence Clip Trimmer",
@@ -2118,6 +2197,63 @@ def get_model_status_html(theme="dark"):
     return "".join(parts)
 
 
+def auto_detect_scene(video_bytes: bytes) -> str:
+    """
+    Auto-detect scene type from first ~30 frames.
+    Returns 'HockeyFight' or 'RWF-2000'.
+
+    Heuristics:
+    - HockeyFight: high saturation (ice rink colours), fast uniform motion,
+      aspect ratio close to 4:3, bright background.
+    - RWF-2000: lower saturation (street/CCTV), more varied colours,
+      wider aspect ratio, darker overall scene.
+    """
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(video_bytes); tmp_path = tmp.name
+        cap = cv2.VideoCapture(tmp_path)
+        frames_hsv = []
+        count = 0
+        while count < 30:
+            ok, f = cap.read()
+            if not ok: break
+            small = cv2.resize(f, (160, 90))
+            hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+            frames_hsv.append(hsv)
+            count += 1
+        cap.release()
+        os.unlink(tmp_path)
+
+        if not frames_hsv:
+            return "RWF-2000"
+
+        arr = np.stack(frames_hsv)          # (N, H, W, 3)
+        mean_sat   = float(arr[:, :, :, 1].mean())   # S channel
+        mean_val   = float(arr[:, :, :, 2].mean())   # V (brightness)
+
+        # Frame-to-frame motion magnitude
+        motion_scores = []
+        for i in range(1, len(frames_hsv)):
+            diff = cv2.absdiff(frames_hsv[i][:,:,2], frames_hsv[i-1][:,:,2])
+            motion_scores.append(float(diff.mean()))
+        mean_motion = float(np.mean(motion_scores)) if motion_scores else 0.
+
+        # Decision:
+        # Hockey: bright (val>120), high saturation (>60), fast motion (>8)
+        # RWF:    darker, lower sat, slower motion typical of CCTV
+        score_hockey = 0
+        if mean_val > 110:   score_hockey += 2   # bright scene → ice rink / arena
+        if mean_sat > 55:    score_hockey += 2   # saturated colours → sports broadcast
+        if mean_motion > 7:  score_hockey += 1   # fast motion → sport
+        if mean_val < 90:    score_hockey -= 2   # dark scene → street CCTV
+
+        detected = "HockeyFight" if score_hockey >= 3 else "RWF-2000"
+        return detected
+    except Exception:
+        return "RWF-2000"   # safe default
+
+
 def render_ingest():
     render_back_button()
     st.markdown("<div class='vg-title'>📥 Ingest</div>", unsafe_allow_html=True)
@@ -2136,7 +2272,15 @@ def render_ingest():
                 if out_dir.exists() and not st.session_state.get("_proc_loaded"):
                     load_analysis_from_folder(out_dir, ds_name, cls_name, folder_name)
                     st.session_state["_proc_loaded"] = True
-                st.success(f"Done. Prediction: **{proc.get('pred_lbl','?')}** · Confidence: {proc.get('conf',0):.1%}")
+                pred_done = proc.get('pred_lbl','?')
+                conf_done = proc.get('conf',0)
+                st.success(f"Done. Prediction: **{pred_done}** · Confidence: {conf_done:.1%}")
+                # Browser notification
+                notif_msg = f"VisionGuard: {pred_done} — {conf_done:.0%} confidence"
+                st.markdown(f"""<script>
+                if(Notification.permission==='granted'){{new Notification('{notif_msg}')}}
+                else if(Notification.permission!=='denied'){{Notification.requestPermission().then(p=>{{if(p==='granted')new Notification('{notif_msg}')}})}}
+                </script>""", unsafe_allow_html=True)
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     if st.button("Open Review Workspace →", type="primary", use_container_width=True):
@@ -2185,26 +2329,46 @@ def render_ingest():
                     "The app tried to download them automatically on startup — "
                     "check your internet connection and restart, or place the `.pth` files manually."
                 )
-                st.info(
-                    "Alternatively, use **📹 Raw Video Input** for instant motion-energy proxy "
-                    "analysis — no checkpoint required."
-                )
-                if st.button("Go to Raw Video Input →", type="primary"):
-                    go_to("📹 Raw Video Input")
             else:
+                # ── Model guide ───────────────────────────────
+                st.markdown(
+                    f"<div style='background:{bg3};border:1px solid {bord};border-radius:10px;"
+                    f"padding:12px 16px;margin-bottom:14px;'>"
+                    f"<div style='font-weight:700;color:{tblue};margin-bottom:8px;font-size:.9rem;'>📋 Which model should I pick?</div>"
+                    f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:10px;'>"
+                    f"<div style='background:rgba(126,207,255,0.06);border:1px solid {bord};border-radius:8px;padding:10px 12px;'>"
+                    f"<div style='font-weight:700;color:#7ecfff;margin-bottom:6px;'>🏒 HockeyFight</div>"
+                    f"<div style='font-size:12px;color:#7a99b0;line-height:1.8;'>"
+                    f"✅ Sports footage (hockey, boxing, football)<br>"
+                    f"✅ Bright, well-lit scenes<br>"
+                    f"✅ Broadcast or high-quality camera<br>"
+                    f"✅ Fast-paced motion</div>"
+                    f"</div>"
+                    f"<div style='background:rgba(224,82,82,0.06);border:1px solid {bord};border-radius:8px;padding:10px 12px;'>"
+                    f"<div style='font-weight:700;color:#e05252;margin-bottom:6px;'>🎥 RWF-2000</div>"
+                    f"<div style='font-size:12px;color:#7a99b0;line-height:1.8;'>"
+                    f"✅ Street or outdoor scenes<br>"
+                    f"✅ CCTV / surveillance footage<br>"
+                    f"✅ Darker or lower quality video<br>"
+                    f"✅ Real-world public spaces</div>"
+                    f"</div>"
+                    f"</div></div>",
+                    unsafe_allow_html=True
+                )
+
                 col1, col2 = st.columns(2)
                 with col1:
                     dataset_key = st.selectbox(
-                        "Dataset / Model",
+                        "Select Model",
                         list(available.keys()),
                         key="proc_ds_sel",
-                        help="Only models with checkpoints present are shown."
+                        help="Pick based on your video type — see guide above."
                     )
                     cfg_s      = available[dataset_key]
                     true_label = st.selectbox("True Label", DATASETS[cfg_s["name"]], key="proc_lbl_sel")
                     uploaded   = st.file_uploader("Upload video", type=["mp4","avi","mov","mkv"], key="proc_upload")
                 with col2:
-                    with st.expander("Model & pipeline details", expanded=False):
+                    with st.expander("Model details", expanded=False):
                         ckpt_ok = Path(cfg_s["ckpt"]).exists()
                         st.markdown(
                             f"<div style='font-size:12px;line-height:1.8;'>"
@@ -2213,18 +2377,10 @@ def render_ingest():
                             f"<b>Window size:</b> {cfg_s['window_size']} &nbsp;"
                             f"<b>Stride:</b> {cfg_s['window_stride']}<br>"
                             f"<b>Onset threshold:</b> {cfg_s['onset_thresh']} &nbsp;"
-                            f"<b>Spike delta:</b> {cfg_s['spike_delta']}<br>"
-                            f"<b>Pred threshold:</b> {cfg_s['pred_thresh']} &nbsp;"
-                            f"<b>FC dropout:</b> {cfg_s['fc_dropout']}"
+                            f"<b>Pred threshold:</b> {cfg_s['pred_thresh']}"
                             f"</div>",
                             unsafe_allow_html=True
                         )
-                        if len(available) < len(PROC_CONFIGS):
-                            missing = [k for k in PROC_CONFIGS if k not in available]
-                            st.warning(
-                                f"Missing checkpoints for: **{', '.join(missing)}**. "
-                                f"Restart the app with internet access to auto-download."
-                            )
 
                 if uploaded and st.button("▶ Run Processing Pipeline", type="primary", use_container_width=True):
                     out_name = _safe_name(Path(uploaded.name).stem)
@@ -2245,6 +2401,38 @@ def render_ingest():
                     t.start()
                     st.session_state._proc_thread = t
                     st.rerun()
+
+                # ── Video thumbnail preview + time estimate ──
+                if uploaded:
+                    try:
+                        import tempfile
+                        vid_bytes_prev = uploaded.getvalue()
+                        with tempfile.NamedTemporaryFile(suffix=Path(uploaded.name).suffix, delete=False) as tmp:
+                            tmp.write(vid_bytes_prev); tmp_path = tmp.name
+                        cap = cv2.VideoCapture(tmp_path)
+                        fps_v   = cap.get(cv2.CAP_PROP_FPS) or 25.
+                        n_frames_v = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        duration_s = n_frames_v / fps_v if fps_v > 0 else 0
+                        # grab frame at 10% in
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(n_frames_v * 0.1)))
+                        ok, thumb = cap.read(); cap.release()
+                        os.unlink(tmp_path)
+                        if ok:
+                            thumb_rgb = cv2.cvtColor(cv2.resize(thumb,(320,180)), cv2.COLOR_BGR2RGB)
+                            est_mins = max(1, int(n_frames_v / 25 * 0.8))
+                            st.markdown(
+                                f"<div style='margin-top:10px;background:{bg3};border:1px solid {bord};"
+                                f"border-radius:10px;padding:10px 14px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;'>"
+                                f"<div style='font-size:.8rem;color:{tblue};font-weight:700;'>📹 Preview</div>"
+                                f"<div style='font-size:.8rem;color:#7a99b0;'>Duration: <b style='color:#e8f4ff'>{duration_s:.1f}s</b> · "
+                                f"Frames: <b style='color:#e8f4ff'>{n_frames_v}</b> · "
+                                f"Est. time: <b style='color:#f5a623'>~{est_mins} min</b></div>"
+                                f"</div>",
+                                unsafe_allow_html=True
+                            )
+                            st.image(thumb_rgb, caption="Frame preview (10% into video)", width=320)
+                    except Exception:
+                        pass
 
     with tab2:
         st.markdown("Upload a ZIP of pre-organised video folders per dataset / class.")
@@ -2361,12 +2549,66 @@ def render_review_overview_tab(pred, files, fps, scores):
     conf  = pred.get("confidence","?")
     onset = pred.get("onset_time","N/A")
     total = pred.get("total_frames","?")
+    folder = st.session_state.active_folder_name
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Prediction", pred.get("pred_label","?"))
     c2.metric("Confidence", conf)
     c3.metric("Onset time", onset)
     c4.metric("Total frames", total)
+
+    # ── Plain-English summary ──
+    try:
+        conf_f  = float(str(conf).replace("%",""))
+        conf_f  = conf_f/100 if conf_f > 1 else conf_f
+        conf_pct = f"{conf_f*100:.0f}%"
+    except: conf_pct = str(conf)
+
+    if is_f:
+        try:
+            onset_frame = int(pred.get("onset_frame",0))
+            fps_s = float(fps) if fps else 25.
+            total_f = int(total) if str(total).isdigit() else 100
+            duration_after = (total_f - onset_frame) / fps_s
+            summary_txt = (f"A fight was detected with <b>{conf_pct}</b> confidence. "
+                           f"The first signs of violence appeared at <b>{onset}</b> into the video "
+                           f"and continued for approximately <b>{duration_after:.1f}s</b>. "
+                           f"Review the Combined CAM video below to see which regions the model focused on.")
+            card_color = "rgba(224,82,82,0.08)"; border_color = "#e05252"; title_color = "#ff5555"
+            title_txt = "⚠ Fight detected"
+        except:
+            summary_txt = f"A fight was detected with {conf_pct} confidence. Check the CAM videos for details."
+            card_color = "rgba(224,82,82,0.08)"; border_color = "#e05252"; title_color = "#ff5555"
+            title_txt = "⚠ Fight detected"
+    else:
+        summary_txt = (f"No violence was detected in this video (confidence <b>{conf_pct}</b>). "
+                       f"The model found no aggressive motion patterns exceeding the detection threshold "
+                       f"across all <b>{total}</b> frames.")
+        card_color = "rgba(61,214,172,0.06)"; border_color = "#3dd6ac"; title_color = "#3dd6ac"
+        title_txt = "✓ No violence detected"
+
+    # Copy-to-clipboard text
+    copy_text = f"{pred.get('pred_label','?')} · {conf_pct} confidence · onset {onset} · {folder}"
+    st.markdown(
+        f"<div style='background:{card_color};border:1px solid {border_color};border-radius:10px;"
+        f"padding:14px 16px;margin:10px 0;'>"
+        f"<div style='font-weight:700;color:{title_color};margin-bottom:6px;'>{title_txt}</div>"
+        f"<div style='font-size:.88rem;color:#c8d8e8;line-height:1.7;'>{summary_txt}</div>"
+        f"<div style='margin-top:10px;display:flex;align-items:center;gap:8px;'>"
+        f"<code style='font-size:.75rem;color:#7a99b0;background:#0a0f18;padding:3px 8px;border-radius:4px;'>{copy_text}</code>"
+        f"<button onclick=\"navigator.clipboard.writeText('{copy_text}').then(()=>{{this.textContent='✅ Copied!';setTimeout(()=>this.textContent='📋 Copy',1500)}})\""
+        f" style='background:#1a2535;border:1px solid #2a3f5f;color:#7ecfff;border-radius:6px;"
+        f"padding:3px 10px;font-size:.75rem;cursor:pointer;'>📋 Copy</button>"
+        f"</div></div>",
+        unsafe_allow_html=True
+    )
+
+    # ── Done notification (browser) ──
+    st.markdown("""
+    <script>
+    if (Notification && Notification.permission !== 'granted') Notification.requestPermission();
+    </script>
+    """, unsafe_allow_html=True)
 
     st.markdown("**Original vs Combined CAM**")
     vc1, vc2 = st.columns(2)
@@ -2683,6 +2925,62 @@ def render_review_report_tab(pred, scores, fps):
                            mime="text/plain",
                            use_container_width=True)
 
+    # ── ZIP all outputs ──
+    ds_act  = st.session_state.active_dataset
+    cls_act = st.session_state.active_class
+    folder_path_rep = class_root(ds_act, cls_act) / folder if ds_act and cls_act else None
+    if folder_path_rep and folder_path_rep.exists():
+        zip_buf2 = io.BytesIO()
+        with zipfile.ZipFile(zip_buf2,"w",zipfile.ZIP_DEFLATED) as zf2:
+            for f2 in folder_path_rep.iterdir():
+                if f2.is_file(): zf2.write(f2, arcname=f2.name)
+        zip_buf2.seek(0)
+        st.download_button("📦 Download All Outputs (ZIP)",
+                           data=zip_buf2,
+                           file_name=f"{folder}_all_outputs.zip",
+                           mime="application/zip",
+                           use_container_width=True)
+
+    st.markdown("---")
+    # ── Rename folder ──
+    st.markdown("**✏️ Rename this analysis**")
+    new_name = st.text_input("New name", value=folder, key="rep_rename_inp")
+    if st.button("Rename", key="rep_rename_btn"):
+        if new_name and new_name != folder and new_name.strip():
+            safe_new = _safe_name(new_name.strip())
+            old_path = class_root(ds_act, cls_act) / folder
+            new_path = class_root(ds_act, cls_act) / safe_new
+            if old_path.exists() and not new_path.exists():
+                old_path.rename(new_path)
+                st.session_state.active_folder_name = safe_new
+                st.success(f"Renamed to '{safe_new}'")
+                st.rerun()
+            else:
+                st.error("Could not rename — folder already exists or path not found.")
+
+    # ── Delete folder ──
+    st.markdown("**🗑 Delete this analysis**")
+    st.warning("This permanently deletes all output files for this video.")
+    if st.button("🗑 Delete analysis", key="rep_delete_btn", type="primary"):
+        st.session_state["_confirm_delete"] = True
+    if st.session_state.get("_confirm_delete"):
+        st.error(f"Are you sure you want to delete **{folder}**? This cannot be undone.")
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            if st.button("✅ Yes, delete", key="rep_confirm_del"):
+                del_path = class_root(ds_act, cls_act) / folder
+                if del_path.exists():
+                    shutil.rmtree(del_path, ignore_errors=True)
+                st.session_state.active_folder_name = ""
+                st.session_state.active_pred = {}
+                st.session_state["_confirm_delete"] = False
+                st.success("Deleted.")
+                st.rerun()
+        with dc2:
+            if st.button("❌ Cancel", key="rep_cancel_del"):
+                st.session_state["_confirm_delete"] = False
+                st.rerun()
+
     with st.expander("Preview email draft", expanded=False):
         st.text_area("Email text", value=email_text, height=280, key="email_ta_prev")
 
@@ -2839,7 +3137,16 @@ def render_history():
     hist = st.session_state.get("_history", [])
 
     if not hist:
-        st.info("No analysis history yet. Process a video to get started.")
+        st.markdown(
+            f"<div style='text-align:center;padding:3rem 1rem;'>"
+            f"<div style='font-size:3rem;margin-bottom:1rem;'>📭</div>"
+            f"<div style='font-size:1.1rem;font-weight:700;color:#e8f4ff;margin-bottom:.5rem;'>No analyses yet</div>"
+            f"<div style='color:#7a99b0;font-size:.9rem;margin-bottom:1.5rem;'>Upload your first video to get started.</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+        if st.button("📥 Go to Ingest →", type="primary"):
+            go_to("📥 Ingest")
         return
 
     hcol1, hcol2, hcol3 = st.columns([2,1,1])
@@ -2860,8 +3167,10 @@ def render_history():
     st.caption(f"Showing {len(filtered_hist)} of {len(hist)} entries")
 
     if st.button("⬇️ Export full history JSON", use_container_width=False):
-        st.download_button("Download history.json", data=json.dumps(hist, indent=2),
-                           file_name="visionguard_history.json", mime="application/json")
+        pass
+    st.download_button("⬇️ Download full history JSON", data=json.dumps(hist, indent=2),
+                       file_name="visionguard_history.json", mime="application/json",
+                       key="hist_export_all")
 
     st.markdown("---")
 
@@ -4273,8 +4582,6 @@ if nav == "🏠 Home":
     render_home()
 elif nav == "📥 Ingest":
     render_ingest()
-elif nav == "📹 Raw Video Input":
-    render_raw_video_input()
 elif nav == "🧪 Review Workspace":
     render_review_workspace()
 elif nav == "📊 Dataset Lab":
